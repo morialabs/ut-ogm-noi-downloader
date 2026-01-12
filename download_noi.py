@@ -16,6 +16,7 @@ Usage:
 import asyncio
 import argparse
 import re
+import requests
 from datetime import date
 from pathlib import Path
 from typing import Optional
@@ -156,10 +157,17 @@ async def click_view_button_for_row(sf_frame, context, row_index: int) -> Option
     We need to hover over the row first to reveal the button.
     """
 
+    # Close any open detail panels first (they cause duplicate row selectors)
+    try:
+        await sf_frame.page.keyboard.press('Escape')
+        await sf_frame.page.wait_for_timeout(500)
+    except Exception:
+        pass  # Ignore if this fails
+
     # Strategy 1: Hover over row to reveal button, then click
     try:
-        row_selector = f'tr[data-row-key-value="row-{row_index}"]'
-        row = sf_frame.locator(row_selector)
+        row_selector = f'tr[data-row-key-value="row-{row_index}"]:visible'
+        row = sf_frame.locator(row_selector).first  # Use :visible and .first to handle duplicate rows
 
         # Hover over the row to reveal the VIEW button
         await row.hover()
@@ -169,51 +177,97 @@ async def click_view_button_for_row(sf_frame, context, row_index: int) -> Option
         view_button = row.locator('lightning-button-icon').first
 
         # Set up listener for new page before clicking
+        captured_pdf_url = None
+
+        async def on_new_page(new_page):
+            nonlocal captured_pdf_url
+
+            # Set up request capture on new page before any requests fire
+            def on_request(request):
+                nonlocal captured_pdf_url
+                url = request.url
+                if '.pdf' in url.lower() or 's3.amazonaws' in url.lower():
+                    captured_pdf_url = url
+
+            new_page.on('request', on_request)
+
+        context.on('page', on_new_page)
+
         async with context.expect_page(timeout=30000) as new_page_info:
             await view_button.click(force=True)  # force click in case of overlay
 
         new_page = await new_page_info.value
-        await new_page.wait_for_load_state("networkidle", timeout=30000)
+
+        # Wait a bit for the request to be captured
+        await sf_frame.page.wait_for_timeout(2000)
+
+        # Get the URL from the page
         pdf_url = new_page.url
-        return pdf_url
+
+        # If we captured a PDF URL from the request, use that instead
+        if captured_pdf_url:
+            pdf_url = captured_pdf_url
+
+        # Only return if we got a valid URL
+        if pdf_url and pdf_url.startswith('http'):
+            return pdf_url
 
     except Exception as e:
         print(f"       Strategy 1 (hover+click) failed: {e}")
+        try:
+            await sf_frame.page.unroute('**/*')
+        except Exception:
+            pass
 
-    # Strategy 2: JavaScript to hover and click
+    # Strategy 2: Click row to open detail panel, find PDF link there
     try:
-        result = await sf_frame.evaluate(f"""
-            (() => {{
-                const row = document.querySelector('tr[data-row-key-value="row-{row_index}"]');
-                if (row) {{
-                    // Trigger hover effect
-                    row.dispatchEvent(new MouseEvent('mouseenter', {{ bubbles: true }}));
-                    row.dispatchEvent(new MouseEvent('mouseover', {{ bubbles: true }}));
+        row_selector = f'tr[data-row-key-value="row-{row_index}"]:visible'
+        row = sf_frame.locator(row_selector).first
 
-                    // Find and click the button
-                    const btn = row.querySelector('lightning-button-icon');
-                    if (btn) {{
-                        btn.click();
-                        return {{ clicked: true, method: 'js-hover-click' }};
-                    }}
-                }}
-                return {{ clicked: false }};
-            }})()
-        """)
+        # Click the row to open detail panel
+        await row.click()
+        await sf_frame.page.wait_for_timeout(2000)
 
-        if result and result.get('clicked'):
+        # Look for PDF links in the detail panel
+        pdf_links = sf_frame.locator('a[href*=".pdf"], a[href*="s3.amazonaws"]')
+        pdf_count = await pdf_links.count()
+
+        if pdf_count > 0:
+            href = await pdf_links.first.get_attribute('href')
+            if href and href.startswith('http'):
+                # Close detail panel
+                await sf_frame.page.keyboard.press('Escape')
+                return href
+
+        # Alternative: look for VIEW button in detail panel and extract URL from its data
+        detail_view_btns = sf_frame.locator('.slds-panel lightning-button-icon, [data-action="view"]')
+        btn_count = await detail_view_btns.count()
+
+        if btn_count > 0:
+            # Try clicking the view button in detail panel
+            async with context.expect_page(timeout=15000) as new_page_info:
+                await detail_view_btns.first.click(force=True)
+            new_page = await new_page_info.value
             await sf_frame.page.wait_for_timeout(3000)
-            all_pages = context.pages
-            if len(all_pages) > 1:
-                return all_pages[-1].url
+            url = new_page.url
+            if url and url.startswith('http'):
+                return url
+
+        # Close detail panel before continuing
+        await sf_frame.page.keyboard.press('Escape')
+        await sf_frame.page.wait_for_timeout(500)
 
     except Exception as e:
-        print(f"       Strategy 2 (JS hover+click) failed: {e}")
+        print(f"       Strategy 2 (detail panel) failed: {e}")
+        try:
+            await sf_frame.page.keyboard.press('Escape')
+        except Exception:
+            pass
 
     # Strategy 3: Direct force click on the hidden button
     try:
-        row_selector = f'tr[data-row-key-value="row-{row_index}"]'
-        row = sf_frame.locator(row_selector)
+        row_selector = f'tr[data-row-key-value="row-{row_index}"]:visible'
+        row = sf_frame.locator(row_selector).first  # Use :visible and .first to handle duplicate rows
         view_button = row.locator('lightning-button-icon').first
 
         async with context.expect_page(timeout=30000) as new_page_info:
@@ -221,7 +275,9 @@ async def click_view_button_for_row(sf_frame, context, row_index: int) -> Option
 
         new_page = await new_page_info.value
         await new_page.wait_for_load_state("networkidle", timeout=30000)
-        return new_page.url
+        url = new_page.url
+        if url and url.startswith('http'):
+            return url
 
     except Exception as e:
         print(f"       Strategy 3 (dispatch click) failed: {e}")
@@ -231,7 +287,9 @@ async def click_view_button_for_row(sf_frame, context, row_index: int) -> Option
     all_pages = context.pages
     if len(all_pages) > 1:
         pdf_page = all_pages[-1]
-        return pdf_page.url
+        url = pdf_page.url
+        if url and url.startswith('http'):
+            return url
 
     return None
 
@@ -248,19 +306,26 @@ async def download_pdf(page, pdf_url: str, record: dict) -> Optional[Path]:
     filename = f"{permit_id}_{doc_date}.pdf"
     output_path = permit_dir / filename
 
-    # Download the PDF
-    response = await page.request.get(pdf_url)
-    content_bytes = await response.body()
+    # Download the PDF using requests library (more reliable than Playwright for S3)
+    try:
+        response = requests.get(pdf_url, timeout=30, headers={
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+        })
+        response.raise_for_status()
+        content_bytes = response.content
 
-    # Verify it's a PDF
-    if content_bytes[:4] == b'%PDF':
-        output_path.write_bytes(content_bytes)
-        return output_path
-    else:
-        # Save anyway but warn
-        output_path.write_bytes(content_bytes)
-        print(f"       Warning: Content may not be PDF (first bytes: {content_bytes[:10]})")
-        return output_path
+        # Verify it's a PDF
+        if content_bytes[:4] == b'%PDF':
+            output_path.write_bytes(content_bytes)
+            return output_path
+        else:
+            # Save anyway but warn
+            output_path.write_bytes(content_bytes)
+            print(f"       Warning: Content may not be PDF (first bytes: {content_bytes[:10]})")
+            return output_path
+    except requests.RequestException as e:
+        print(f"       Download error: {e}")
+        return None
 
 
 async def cleanup_extra_tabs(context):
@@ -410,7 +475,18 @@ async def download_all_nois(
     }
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
+        # Use Chrome browser with stealth flags for better compatibility
+        browser_args = [
+            '--disable-blink-features=AutomationControlled',
+        ]
+        if headless:
+            browser_args.append('--headless=new')
+
+        browser = await p.chromium.launch(
+            headless=headless,
+            channel="chrome",  # Use actual Chrome instead of Chromium
+            args=browser_args
+        )
         context = await browser.new_context(viewport={"width": 1920, "height": 1080})
         page = await context.new_page()
 
@@ -419,10 +495,19 @@ async def download_all_nois(
 
         def capture_request(request):
             url = request.url
-            if ".pdf" in url.lower() or "s3.amazonaws" in url.lower():
+            # Capture various PDF URL patterns
+            if any(pattern in url.lower() for pattern in [
+                ".pdf", "s3.amazonaws", "sfc/servlet", "contentdocument",
+                "filedownload", "documentforce"
+            ]):
                 pdf_urls.append(url)
 
+        # Capture requests from all pages in the context
+        def on_page_created(new_page):
+            new_page.on("request", capture_request)
+
         page.on("request", capture_request)
+        context.on("page", on_page_created)
 
         try:
             print("[1/4] Navigating to minerals-files page...")
@@ -533,15 +618,17 @@ async def download_all_nois(
 
                     # Attempt download with retries
                     success = False
+                    pdf_urls.clear()  # Clear before each attempt
                     for attempt in range(MAX_RETRIES):
                         try:
                             pdf_url = await click_view_button_for_row(sf_frame, context, record['row_index'])
 
-                            if not pdf_url and pdf_urls:
+                            # Fallback to network-captured URL if click didn't return a valid URL
+                            if (not pdf_url or not pdf_url.startswith('http')) and pdf_urls:
                                 pdf_url = pdf_urls[-1]
-                                pdf_urls.clear()
 
-                            if pdf_url:
+                            # Validate URL before attempting download
+                            if pdf_url and pdf_url.startswith('http'):
                                 output_path = await download_pdf(page, pdf_url, record)
                                 if output_path:
                                     file_size = output_path.stat().st_size
@@ -550,6 +637,8 @@ async def download_all_nois(
                                     existing.add((permit_id, doc_date))
                                     success = True
                                     break
+                            elif pdf_url:
+                                print(f"       Attempt {attempt + 1}: Invalid URL: {pdf_url[:100]}")
                             else:
                                 print(f"       Attempt {attempt + 1}: No PDF URL found")
 

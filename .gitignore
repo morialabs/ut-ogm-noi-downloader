@@ -1,4 +1,5 @@
 output/
+output_coal/
 venv/
 __pycache__/
 *.pyc
