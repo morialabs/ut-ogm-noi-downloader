@@ -12,10 +12,12 @@ Usage:
     python download_coal.py --single-permit C0070001  # Process only one permit
     python download_coal.py --start-page 5       # Start from page 5
     python download_coal.py --min-year 2015      # Custom year filter
+    python download_coal.py --workers 4          # Run 4 parallel browser instances
 """
 
 import asyncio
 import argparse
+import math
 import re
 import requests
 from pathlib import Path
@@ -596,6 +598,308 @@ def should_download_file(file_info: dict, existing_files: set, min_year: int) ->
     return True, "OK"
 
 
+async def get_total_pages(headless: bool = True) -> int:
+    """Quick probe to get total page count from the portal."""
+    async with async_playwright() as p:
+        browser_args = ['--disable-blink-features=AutomationControlled']
+        browser = await p.chromium.launch(
+            headless=headless,
+            channel="chrome",
+            args=browser_args
+        )
+        context = await browser.new_context(viewport={"width": 1920, "height": 1080})
+        page = await context.new_page()
+
+        try:
+            await page.goto(PORTAL_URL, wait_until="networkidle", timeout=60000)
+            await page.wait_for_selector("iframe", timeout=30000)
+            await page.wait_for_timeout(5000)
+
+            frames = page.frames
+            sf_frame = None
+            for frame in frames:
+                frame_url = frame.url
+                if "site.com" in frame_url.lower() or "salesforce" in frame_url.lower():
+                    sf_frame = frame
+                    break
+
+            if sf_frame is None and len(frames) > 1:
+                sf_frame = frames[1]
+
+            if sf_frame is None:
+                raise Exception("Could not find Salesforce iframe")
+
+            permit_files_tab = sf_frame.get_by_text("Permit Files", exact=True)
+            await permit_files_tab.wait_for(state="visible", timeout=60000)
+            await permit_files_tab.click()
+            await page.wait_for_timeout(5000)
+
+            page_info = await get_current_page_info(sf_frame)
+            return page_info['total']
+
+        finally:
+            await browser.close()
+
+
+async def download_worker(
+    worker_id: int,
+    start_page: int,
+    end_page: int,
+    headless: bool,
+    dry_run: bool,
+    min_year: int,
+    existing: dict,
+    single_permit: Optional[str] = None
+) -> dict:
+    """Independent worker that processes a range of pages."""
+    prefix = f"[W{worker_id}]"
+    stats = {
+        'permits_processed': 0,
+        'total_files_found': 0,
+        'downloaded': 0,
+        'skipped_exists': 0,
+        'skipped_date': 0,
+        'failed': 0
+    }
+
+    async with async_playwright() as p:
+        browser_args = ['--disable-blink-features=AutomationControlled']
+        if headless:
+            browser_args.append('--headless=new')
+
+        browser = await p.chromium.launch(
+            headless=headless,
+            channel="chrome",
+            args=browser_args
+        )
+        context = await browser.new_context(viewport={"width": 1920, "height": 1080})
+        page = await context.new_page()
+
+        try:
+            print(f"{prefix} Navigating to coal-files page...")
+            await page.goto(PORTAL_URL, wait_until="networkidle", timeout=60000)
+
+            await page.wait_for_selector("iframe", timeout=30000)
+            await page.wait_for_timeout(5000)
+
+            frames = page.frames
+            sf_frame = None
+            for frame in frames:
+                frame_url = frame.url
+                if "site.com" in frame_url.lower() or "salesforce" in frame_url.lower():
+                    sf_frame = frame
+                    break
+
+            if sf_frame is None and len(frames) > 1:
+                sf_frame = frames[1]
+
+            if sf_frame is None:
+                raise Exception(f"{prefix} Could not find Salesforce iframe")
+
+            print(f"{prefix} Clicking Permit Files tab...")
+            try:
+                permit_files_tab = sf_frame.get_by_text("Permit Files", exact=True)
+                await permit_files_tab.wait_for(state="visible", timeout=60000)
+                await permit_files_tab.click()
+            except Exception as e:
+                print(f"{prefix} Tab click via locator failed: {e}")
+                await sf_frame.evaluate("""
+                    (() => {
+                        const tabs = document.querySelectorAll('*');
+                        for (const tab of tabs) {
+                            if (tab.textContent.trim() === 'Permit Files' && tab.offsetParent !== null) {
+                                tab.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    })()
+                """)
+
+            await page.wait_for_timeout(5000)
+
+            # Navigate to start_page if not page 1
+            if start_page > 1:
+                print(f"{prefix} Navigating to page {start_page}...")
+                for _ in range(start_page - 1):
+                    await navigate_to_next_page(sf_frame)
+
+            print(f"{prefix} Processing pages {start_page} to {end_page}")
+
+            for page_num in range(start_page, end_page + 1):
+                print(f"\n{prefix} {'='*40}")
+                print(f"{prefix} PAGE {page_num}")
+                print(f"{prefix} {'='*40}")
+
+                permits = await get_all_permits_on_page(sf_frame)
+                print(f"{prefix} Found {len(permits)} permits on this page")
+
+                for permit in permits:
+                    permit_id = permit.get('permit_id', 'unknown')
+                    mine_name = permit.get('mine_name', 'unknown')
+
+                    if single_permit and permit_id != single_permit:
+                        continue
+
+                    stats['permits_processed'] += 1
+                    safe_mine_name = sanitize_mine_name(mine_name)
+                    existing_files = existing.get(safe_mine_name, set())
+
+                    print(f"\n{prefix}   PERMIT: {permit_id} - {mine_name}")
+
+                    if not await click_permit_row(sf_frame, permit['row_index']):
+                        print(f"{prefix}       FAILED to open permit {permit_id}")
+                        stats['failed'] += 1
+                        continue
+
+                    await sort_by_doc_year(sf_frame)
+
+                    files = await get_files_in_permit(sf_frame)
+                    stats['total_files_found'] += len(files)
+                    print(f"{prefix}       Found {len(files)} files in permit")
+
+                    for file_info in files:
+                        description = file_info.get('description', 'Document')
+                        doc_year = file_info.get('doc_year', 0)
+                        file_date = file_info.get('file_date', '')
+
+                        should_dl, reason = should_download_file(file_info, existing_files, min_year)
+
+                        if not should_dl:
+                            if 'already' in reason.lower():
+                                stats['skipped_exists'] += 1
+                            elif 'year' in reason.lower():
+                                stats['skipped_date'] += 1
+                            print(f"{prefix}       SKIP: {description[:40]} ({file_date}) - {reason}")
+                            continue
+
+                        print(f"{prefix}       {'[DRY RUN] ' if dry_run else ''}Downloading: {description[:40]} ({file_date})")
+
+                        if dry_run:
+                            stats['downloaded'] += 1
+                            continue
+
+                        success = False
+
+                        for attempt in range(MAX_RETRIES):
+                            try:
+                                pdf_url = await click_file_and_get_url(sf_frame, context, file_info['row_index'])
+
+                                if pdf_url and pdf_url.startswith('http'):
+                                    output_path = await download_coal_file(pdf_url, mine_name, file_info)
+                                    if output_path:
+                                        file_size = output_path.stat().st_size
+                                        print(f"{prefix}         SUCCESS: {output_path.name} ({file_size:,} bytes)")
+                                        stats['downloaded'] += 1
+                                        existing_files.add(output_path.name)
+                                        success = True
+                                        break
+                                else:
+                                    print(f"{prefix}         Attempt {attempt + 1}: No PDF URL found")
+
+                            except Exception as e:
+                                print(f"{prefix}         Attempt {attempt + 1}/{MAX_RETRIES} failed: {e}")
+
+                            await cleanup_extra_tabs(context)
+                            await asyncio.sleep(RATE_LIMIT_DELAY)
+
+                        if not success:
+                            stats['failed'] += 1
+                            print(f"{prefix}         FAILED: {description[:40]} after {MAX_RETRIES} attempts")
+
+                        await asyncio.sleep(RATE_LIMIT_DELAY)
+
+                    await navigate_back_to_permit_list(sf_frame)
+                    await cleanup_extra_tabs(context)
+
+                    if single_permit and permit_id == single_permit:
+                        print(f"\n{prefix} Single permit {single_permit} processed. Stopping.")
+                        return stats
+
+                if page_num < end_page:
+                    print(f"\n{prefix} Navigating to page {page_num + 1}...")
+                    has_next = await navigate_to_next_page(sf_frame)
+                    if not has_next:
+                        print(f"{prefix} Warning: Could not navigate to next page")
+                        break
+
+            return stats
+
+        finally:
+            await browser.close()
+
+
+async def download_parallel(
+    num_workers: int = 4,
+    headless: bool = True,
+    dry_run: bool = False,
+    min_year: int = 2020,
+    single_permit: Optional[str] = None
+) -> dict:
+    """Launch multiple workers to download in parallel."""
+    print(f"Probing portal for total page count...")
+    total_pages = await get_total_pages(headless=headless)
+    print(f"Total pages: {total_pages}")
+
+    # Adjust workers if more than pages
+    actual_workers = min(num_workers, total_pages)
+    if actual_workers < num_workers:
+        print(f"Reducing workers from {num_workers} to {actual_workers} (only {total_pages} pages)")
+
+    pages_per_worker = math.ceil(total_pages / actual_workers)
+
+    existing = get_existing_coal_documents()
+    total_existing = sum(len(files) for files in existing.values())
+    print(f"Found {total_existing} existing documents across {len(existing)} mines")
+
+    print(f"\nLaunching {actual_workers} parallel workers...")
+    print("=" * 60)
+
+    tasks = []
+    for i in range(actual_workers):
+        start = i * pages_per_worker + 1
+        end = min((i + 1) * pages_per_worker, total_pages)
+
+        print(f"  Worker {i}: pages {start}-{end}")
+
+        task = download_worker(
+            worker_id=i,
+            start_page=start,
+            end_page=end,
+            headless=headless,
+            dry_run=dry_run,
+            min_year=min_year,
+            existing=existing,
+            single_permit=single_permit
+        )
+        tasks.append(task)
+
+    print("=" * 60)
+    print()
+
+    # Run all workers concurrently
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Aggregate stats
+    total_stats = {
+        'permits_processed': 0,
+        'total_files_found': 0,
+        'downloaded': 0,
+        'skipped_exists': 0,
+        'skipped_date': 0,
+        'failed': 0
+    }
+
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            print(f"Worker {i} failed with error: {result}")
+            continue
+        for key in total_stats:
+            total_stats[key] += result.get(key, 0)
+
+    return total_stats
+
+
 async def download_all_coal_files(
     headless: bool = False,
     dry_run: bool = False,
@@ -825,6 +1129,7 @@ async def main():
     parser.add_argument("--end-page", type=int, default=None, help="Stop at specific page (default: all)")
     parser.add_argument("--min-year", type=int, default=DEFAULT_MIN_YEAR, help=f"Minimum document year (default: {DEFAULT_MIN_YEAR})")
     parser.add_argument("--single-permit", type=str, default=None, help="Process only this permit ID (for testing)")
+    parser.add_argument("--workers", type=int, default=1, help="Number of parallel browser instances (default: 1)")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -832,20 +1137,36 @@ async def main():
     print("=" * 60)
     print(f"Mode:          {'Headless' if args.headless else 'Visible browser'}")
     print(f"Dry run:       {args.dry_run}")
-    print(f"Pages:         {args.start_page} to {args.end_page or 'end'}")
+    print(f"Workers:       {args.workers}")
+    if args.workers == 1:
+        print(f"Pages:         {args.start_page} to {args.end_page or 'end'}")
     print(f"Min year:      {args.min_year}")
     print(f"Single permit: {args.single_permit or 'None (all permits)'}")
     print()
 
     try:
-        stats = await download_all_coal_files(
-            headless=args.headless,
-            dry_run=args.dry_run,
-            start_page=args.start_page,
-            end_page=args.end_page,
-            min_year=args.min_year,
-            single_permit=args.single_permit
-        )
+        if args.workers > 1:
+            # Parallel mode - ignores start_page/end_page, distributes automatically
+            if args.start_page != 1 or args.end_page is not None:
+                print("Note: --start-page and --end-page are ignored in parallel mode")
+                print()
+            stats = await download_parallel(
+                num_workers=args.workers,
+                headless=args.headless,
+                dry_run=args.dry_run,
+                min_year=args.min_year,
+                single_permit=args.single_permit
+            )
+        else:
+            # Sequential mode - original behavior
+            stats = await download_all_coal_files(
+                headless=args.headless,
+                dry_run=args.dry_run,
+                start_page=args.start_page,
+                end_page=args.end_page,
+                min_year=args.min_year,
+                single_permit=args.single_permit
+            )
 
         print()
         print("=" * 60)
