@@ -20,9 +20,29 @@ import argparse
 import math
 import re
 import requests
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 from playwright.async_api import async_playwright
+
+
+@dataclass
+class PermitWorkItem:
+    """Represents a single permit to be processed by a worker."""
+    permit_id: str
+    mine_name: str
+    page_num: int
+    row_index: int
+
+
+@dataclass
+class SharedState:
+    """Thread-safe shared state for workers."""
+    existing: dict  # dict[str, set] - mine_name -> set of existing filenames
+    downloaded: set  # Newly downloaded file paths
+    downloaded_lock: asyncio.Lock
+    stats: dict
+    stats_lock: asyncio.Lock
 
 # Configuration
 OUTPUT_DIR = Path(__file__).parent / "output_coal"
@@ -326,7 +346,7 @@ async def click_file_and_get_url(sf_frame, context, file_row_index: int) -> Opti
         await sf_frame.page.wait_for_timeout(500)
         view_button = row.locator('lightning-button-icon').first
 
-        async with context.expect_page(timeout=60000) as new_page_info:
+        async with context.expect_page(timeout=180000) as new_page_info:
             await view_button.click(force=True)
 
         new_page = await new_page_info.value
@@ -383,7 +403,7 @@ async def download_coal_file(pdf_url: str, mine_name: str, file_info: dict) -> O
         counter += 1
 
     try:
-        response = requests.get(pdf_url, timeout=60, headers={
+        response = requests.get(pdf_url, timeout=120, headers={
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
         })
         response.raise_for_status()
@@ -561,6 +581,424 @@ async def navigate_to_next_page(sf_frame) -> bool:
     except Exception as e:
         print(f"       Navigation error: {e}")
         return False
+
+
+async def navigate_to_page(sf_frame, target_page: int, current_page: int) -> int:
+    """Navigate from current_page to target_page.
+
+    If target < current, must reload and navigate from page 1.
+    Returns the actual page number after navigation.
+    """
+    if target_page == current_page:
+        return current_page
+
+    if target_page < current_page:
+        # Must reload and start from page 1
+        await sf_frame.page.reload(wait_until="networkidle")
+        await sf_frame.page.wait_for_timeout(5000)
+
+        # Re-click Permit Files tab
+        try:
+            permit_files_tab = sf_frame.get_by_text("Permit Files", exact=True)
+            await permit_files_tab.wait_for(state="visible", timeout=30000)
+            await permit_files_tab.click()
+        except Exception:
+            await sf_frame.evaluate("""
+                (() => {
+                    const tabs = document.querySelectorAll('*');
+                    for (const tab of tabs) {
+                        if (tab.textContent.trim() === 'Permit Files' && tab.offsetParent !== null) {
+                            tab.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                })()
+            """)
+        await sf_frame.page.wait_for_timeout(3000)
+        current_page = 1
+
+    # Navigate forward to target
+    while current_page < target_page:
+        success = await navigate_to_next_page(sf_frame)
+        if success:
+            current_page += 1
+        else:
+            print(f"       Failed to navigate from page {current_page} to {target_page}")
+            break
+
+    return current_page
+
+
+async def get_salesforce_frame(page):
+    """Find and return the Salesforce iframe."""
+    frames = page.frames
+    sf_frame = None
+    for frame in frames:
+        frame_url = frame.url
+        if "site.com" in frame_url.lower() or "salesforce" in frame_url.lower():
+            sf_frame = frame
+            break
+    if sf_frame is None and len(frames) > 1:
+        sf_frame = frames[1]
+    return sf_frame
+
+
+async def setup_permit_files_tab(sf_frame):
+    """Click on Permit Files tab and wait for it to load."""
+    try:
+        permit_files_tab = sf_frame.get_by_text("Permit Files", exact=True)
+        await permit_files_tab.wait_for(state="visible", timeout=60000)
+        await permit_files_tab.click()
+    except Exception:
+        await sf_frame.evaluate("""
+            (() => {
+                const tabs = document.querySelectorAll('*');
+                for (const tab of tabs) {
+                    if (tab.textContent.trim() === 'Permit Files' && tab.offsetParent !== null) {
+                        tab.click();
+                        return true;
+                    }
+                }
+                return false;
+            })()
+        """)
+    await sf_frame.page.wait_for_timeout(5000)
+
+
+async def discover_all_permits(headless: bool = True) -> list:
+    """Phase 1: Scan all pages and collect permit metadata.
+
+    Returns list of PermitWorkItem objects for all permits found.
+    """
+    permits = []
+
+    async with async_playwright() as p:
+        browser_args = ['--disable-blink-features=AutomationControlled']
+        browser = await p.chromium.launch(
+            headless=headless,
+            channel="chrome",
+            args=browser_args
+        )
+        context = await browser.new_context(viewport={"width": 1920, "height": 1080})
+        page = await context.new_page()
+
+        try:
+            print("  Navigating to coal-files page...")
+            await page.goto(PORTAL_URL, wait_until="networkidle", timeout=60000)
+            await page.wait_for_selector("iframe", timeout=30000)
+            await page.wait_for_timeout(5000)
+
+            sf_frame = await get_salesforce_frame(page)
+            if sf_frame is None:
+                raise Exception("Could not find Salesforce iframe")
+
+            await setup_permit_files_tab(sf_frame)
+
+            page_info = await get_current_page_info(sf_frame)
+            total_pages = page_info['total']
+            print(f"  Total pages to scan: {total_pages}")
+
+            current_page = 1
+            while current_page <= total_pages:
+                print(f"  Scanning page {current_page}/{total_pages}...")
+
+                page_permits = await get_all_permits_on_page(sf_frame)
+
+                for permit in page_permits:
+                    permits.append(PermitWorkItem(
+                        permit_id=permit.get('permit_id', 'unknown'),
+                        mine_name=permit.get('mine_name', 'unknown'),
+                        page_num=current_page,
+                        row_index=permit.get('row_index', 0)
+                    ))
+
+                if current_page < total_pages:
+                    success = await navigate_to_next_page(sf_frame)
+                    if success:
+                        current_page += 1
+                    else:
+                        print(f"  Warning: Could not navigate past page {current_page}")
+                        break
+                else:
+                    break
+
+            print(f"  Discovery complete: {len(permits)} permits found")
+
+        finally:
+            await browser.close()
+
+    return permits
+
+
+async def process_permit(
+    worker_id: int,
+    sf_frame,
+    context,
+    permit: PermitWorkItem,
+    shared: SharedState,
+    min_year: int,
+    dry_run: bool
+) -> dict:
+    """Process a single permit: click into it, get files, download matching ones.
+
+    Returns dict with counts: files_found, downloaded, skipped_exists, skipped_date, failed
+    """
+    prefix = f"[W{worker_id}]"
+    local_stats = {
+        'files_found': 0,
+        'downloaded': 0,
+        'skipped_exists': 0,
+        'skipped_date': 0,
+        'failed': 0
+    }
+
+    # Click permit row
+    if not await click_permit_row(sf_frame, permit.row_index):
+        print(f"{prefix}       FAILED to open permit {permit.permit_id}")
+        local_stats['failed'] += 1
+        return local_stats
+
+    await sort_by_doc_year(sf_frame)
+
+    files = await get_files_in_permit(sf_frame)
+    local_stats['files_found'] = len(files)
+    print(f"{prefix}       Found {len(files)} files in permit")
+
+    safe_mine_name = sanitize_mine_name(permit.mine_name)
+    existing_files = shared.existing.get(safe_mine_name, set())
+
+    for file_info in files:
+        description = file_info.get('description', 'Document')
+        file_date = file_info.get('file_date', '')
+
+        should_dl, reason = should_download_file(file_info, existing_files, min_year)
+
+        if not should_dl:
+            if 'already' in reason.lower():
+                local_stats['skipped_exists'] += 1
+            elif 'year' in reason.lower():
+                local_stats['skipped_date'] += 1
+            print(f"{prefix}       SKIP: {description[:40]} ({file_date}) - {reason}")
+            continue
+
+        print(f"{prefix}       {'[DRY RUN] ' if dry_run else ''}Downloading: {description[:40]} ({file_date})")
+
+        if dry_run:
+            local_stats['downloaded'] += 1
+            continue
+
+        success = False
+        for attempt in range(MAX_RETRIES):
+            try:
+                pdf_url = await click_file_and_get_url(sf_frame, context, file_info['row_index'])
+
+                if pdf_url and pdf_url.startswith('http'):
+                    output_path = await download_coal_file(pdf_url, permit.mine_name, file_info)
+                    if output_path:
+                        file_size = output_path.stat().st_size
+                        print(f"{prefix}         SUCCESS: {output_path.name} ({file_size:,} bytes)")
+                        local_stats['downloaded'] += 1
+                        existing_files.add(output_path.name)
+
+                        # Mark as downloaded in shared state
+                        async with shared.downloaded_lock:
+                            shared.downloaded.add(f"{safe_mine_name}/{output_path.name}")
+
+                        success = True
+                        break
+                else:
+                    print(f"{prefix}         Attempt {attempt + 1}: No PDF URL found")
+
+            except Exception as e:
+                print(f"{prefix}         Attempt {attempt + 1}/{MAX_RETRIES} failed: {e}")
+
+            await cleanup_extra_tabs(context)
+            await asyncio.sleep(RATE_LIMIT_DELAY)
+
+        if not success:
+            local_stats['failed'] += 1
+            print(f"{prefix}         FAILED: {description[:40]} after {MAX_RETRIES} attempts")
+
+        await asyncio.sleep(RATE_LIMIT_DELAY)
+
+    await navigate_back_to_permit_list(sf_frame)
+    await cleanup_extra_tabs(context)
+
+    return local_stats
+
+
+async def queue_download_worker(
+    worker_id: int,
+    permit_queue: asyncio.Queue,
+    shared: SharedState,
+    headless: bool,
+    dry_run: bool,
+    min_year: int
+) -> None:
+    """Queue-based download worker that pulls permits from shared queue."""
+    prefix = f"[W{worker_id}]"
+    current_page = 0  # Not yet on any page
+
+    async with async_playwright() as p:
+        browser_args = ['--disable-blink-features=AutomationControlled']
+        if headless:
+            browser_args.append('--headless=new')
+
+        browser = await p.chromium.launch(
+            headless=headless,
+            channel="chrome",
+            args=browser_args
+        )
+        context = await browser.new_context(viewport={"width": 1920, "height": 1080})
+        page = await context.new_page()
+
+        try:
+            print(f"{prefix} Starting worker, navigating to portal...")
+            await page.goto(PORTAL_URL, wait_until="networkidle", timeout=60000)
+            await page.wait_for_selector("iframe", timeout=30000)
+            await page.wait_for_timeout(5000)
+
+            sf_frame = await get_salesforce_frame(page)
+            if sf_frame is None:
+                raise Exception(f"{prefix} Could not find Salesforce iframe")
+
+            await setup_permit_files_tab(sf_frame)
+            current_page = 1
+
+            while True:
+                # Try to get next permit from queue
+                try:
+                    permit = await asyncio.wait_for(
+                        permit_queue.get(),
+                        timeout=10.0
+                    )
+                except asyncio.TimeoutError:
+                    if permit_queue.empty():
+                        print(f"{prefix} Queue empty, worker finishing")
+                        break
+                    continue
+
+                print(f"\n{prefix}   PERMIT: {permit.permit_id} - {permit.mine_name} (page {permit.page_num})")
+
+                # Navigate to correct page if needed
+                if permit.page_num != current_page:
+                    print(f"{prefix}     Navigating from page {current_page} to {permit.page_num}...")
+                    current_page = await navigate_to_page(sf_frame, permit.page_num, current_page)
+
+                # Process the permit
+                local_stats = await process_permit(
+                    worker_id, sf_frame, context, permit,
+                    shared, min_year, dry_run
+                )
+
+                # Update shared stats atomically
+                async with shared.stats_lock:
+                    shared.stats['permits_processed'] = shared.stats.get('permits_processed', 0) + 1
+                    shared.stats['total_files_found'] = shared.stats.get('total_files_found', 0) + local_stats['files_found']
+                    shared.stats['downloaded'] = shared.stats.get('downloaded', 0) + local_stats['downloaded']
+                    shared.stats['skipped_exists'] = shared.stats.get('skipped_exists', 0) + local_stats['skipped_exists']
+                    shared.stats['skipped_date'] = shared.stats.get('skipped_date', 0) + local_stats['skipped_date']
+                    shared.stats['failed'] = shared.stats.get('failed', 0) + local_stats['failed']
+
+                permit_queue.task_done()
+
+        except Exception as e:
+            print(f"{prefix} Worker error: {e}")
+        finally:
+            await browser.close()
+            print(f"{prefix} Worker shut down")
+
+
+async def download_queue_parallel(
+    num_workers: int = 4,
+    headless: bool = True,
+    dry_run: bool = False,
+    min_year: int = 2020,
+    single_permit: Optional[str] = None
+) -> dict:
+    """Queue-based parallel downloading - main entry point.
+
+    Phase 1: Discovery - collect all permits
+    Phase 2: Queue-based download - workers pull from shared queue
+    """
+    print()
+    print("=" * 60)
+    print("PHASE 1: Discovery")
+    print("=" * 60)
+
+    # Discover all permits
+    all_permits = await discover_all_permits(headless=headless)
+    print(f"Discovered {len(all_permits)} permits across all pages")
+
+    # Filter for single permit if specified
+    if single_permit:
+        all_permits = [p for p in all_permits if p.permit_id == single_permit]
+        print(f"Filtered to {len(all_permits)} permits matching {single_permit}")
+
+    if not all_permits:
+        return {
+            'permits_processed': 0,
+            'total_files_found': 0,
+            'downloaded': 0,
+            'skipped_exists': 0,
+            'skipped_date': 0,
+            'failed': 0
+        }
+
+    # Sort by page for efficient navigation
+    all_permits.sort(key=lambda p: (p.page_num, p.row_index))
+
+    # Get existing documents
+    existing = get_existing_coal_documents()
+    total_existing = sum(len(files) for files in existing.values())
+    print(f"Found {total_existing} existing documents across {len(existing)} mines")
+
+    # Create shared state
+    shared = SharedState(
+        existing=existing,
+        downloaded=set(),
+        downloaded_lock=asyncio.Lock(),
+        stats={
+            'permits_processed': 0,
+            'total_files_found': 0,
+            'downloaded': 0,
+            'skipped_exists': 0,
+            'skipped_date': 0,
+            'failed': 0
+        },
+        stats_lock=asyncio.Lock()
+    )
+
+    # Populate queue
+    permit_queue = asyncio.Queue()
+    for permit in all_permits:
+        await permit_queue.put(permit)
+
+    print()
+    print("=" * 60)
+    print("PHASE 2: Queue-Based Download")
+    print("=" * 60)
+    print(f"Starting {num_workers} workers for {len(all_permits)} permits")
+    print()
+
+    # Launch workers
+    workers = [
+        queue_download_worker(
+            worker_id=i,
+            permit_queue=permit_queue,
+            shared=shared,
+            headless=headless,
+            dry_run=dry_run,
+            min_year=min_year
+        )
+        for i in range(num_workers)
+    ]
+
+    # Wait for all workers to complete
+    await asyncio.gather(*workers, return_exceptions=True)
+
+    return shared.stats
 
 
 def should_download_file(file_info: dict, existing_files: set, min_year: int) -> tuple[bool, str]:
@@ -1146,11 +1584,11 @@ async def main():
 
     try:
         if args.workers > 1:
-            # Parallel mode - ignores start_page/end_page, distributes automatically
+            # Queue-based parallel mode - ignores start_page/end_page
             if args.start_page != 1 or args.end_page is not None:
                 print("Note: --start-page and --end-page are ignored in parallel mode")
                 print()
-            stats = await download_parallel(
+            stats = await download_queue_parallel(
                 num_workers=args.workers,
                 headless=args.headless,
                 dry_run=args.dry_run,
