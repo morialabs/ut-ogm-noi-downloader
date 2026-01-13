@@ -70,12 +70,10 @@ def create_collection(client: QdrantClient, collection_name: str) -> None:
 
     client.create_collection(
         collection_name=collection_name,
-        vectors_config={
-            "dense": models.VectorParams(
-                size=VECTOR_SIZE,
-                distance=models.Distance.COSINE,
-            )
-        },
+        vectors_config=models.VectorParams(
+            size=VECTOR_SIZE,
+            distance=models.Distance.COSINE,
+        ),
     )
     print(f"Created collection '{collection_name}'")
 
@@ -293,7 +291,7 @@ def upload_document(
 
         points.append(models.PointStruct(
             id=chunk_id,
-            vector={"dense": embedding},
+            vector=embedding,
             payload={
                 "mine_name": mine_name,  # Root level for Agno compatibility
                 "content": chunk["text"],

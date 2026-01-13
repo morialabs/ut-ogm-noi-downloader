@@ -147,7 +147,6 @@ def search_documents(
     results = qdrant_client.query_points(
         collection_name=collection_name,
         query=query_embedding,
-        using="dense",
         limit=limit,
     )
 
