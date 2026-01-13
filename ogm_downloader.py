@@ -16,10 +16,11 @@ Usage:
 
 import asyncio
 import argparse
+import json
 import math
 import re
 import requests
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
 from playwright.async_api import async_playwright
@@ -68,6 +69,35 @@ class PermitWorkItem:
     mine_name: str
     page_num: int
     row_index: int
+
+
+def get_permits_cache_path(config: PermitTypeConfig) -> Path:
+    """Get the path to the permits cache file for a given config."""
+    return config.output_dir / f".permits_cache_{config.name}.json"
+
+
+def save_permits_cache(permits: list[PermitWorkItem], config: PermitTypeConfig) -> None:
+    """Save the permits list to a JSON cache file."""
+    cache_path = get_permits_cache_path(config)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    permits_data = [asdict(p) for p in permits]
+    cache_path.write_text(json.dumps(permits_data, indent=2))
+    print(f"  Cached {len(permits)} permits to {cache_path}")
+
+
+def load_permits_cache(config: PermitTypeConfig) -> Optional[list[PermitWorkItem]]:
+    """Load the permits list from cache if it exists."""
+    cache_path = get_permits_cache_path(config)
+    if not cache_path.exists():
+        return None
+    try:
+        permits_data = json.loads(cache_path.read_text())
+        permits = [PermitWorkItem(**p) for p in permits_data]
+        print(f"  Loaded {len(permits)} permits from cache ({cache_path})")
+        return permits
+    except (json.JSONDecodeError, TypeError, KeyError) as e:
+        print(f"  Warning: Could not load permits cache: {e}")
+        return None
 
 
 @dataclass
@@ -190,9 +220,9 @@ async def sort_by_doc_year(sf_frame) -> bool:
     """Click on 'Doc Year' column header twice to sort descending (newest first)."""
     try:
         doc_year_header = sf_frame.get_by_text("Doc Year", exact=False).first
-        await doc_year_header.click()
+        await doc_year_header.click(timeout=180000)
         await sf_frame.page.wait_for_timeout(2000)
-        await doc_year_header.click()
+        await doc_year_header.click(timeout=180000)
         await sf_frame.page.wait_for_timeout(2000)
         return True
     except Exception as e:
@@ -312,6 +342,53 @@ async def click_permit_row(sf_frame, row_index: int) -> bool:
         print(f"       JS click failed: {e}")
 
     return False
+
+
+async def ensure_permit_detail_tab(sf_frame) -> None:
+    """Ensure we're viewing the Permit Files tab, not General Files.
+
+    The portal displays both 'Permit Files' and 'General Files' tabs when viewing a permit.
+    If the General Files tab is currently active, this function clicks the Permit Files tab
+    to ensure we retrieve permit-specific documents rather than general files.
+
+    This function is best-effort and does not raise exceptions on failure, as the page
+    may still be usable even if the tab switch fails.
+    """
+    try:
+        body_text = await sf_frame.evaluate("() => document.body.innerText")
+    except Exception as e:
+        print(f"       Tab check warning: {e}")
+        return
+
+    if "General Files" not in body_text:
+        return
+
+    # Try Playwright locator first
+    try:
+        permit_files_tab = sf_frame.get_by_text("Permit Files", exact=True)
+        if await permit_files_tab.count() > 0:
+            await permit_files_tab.first.click()
+            await sf_frame.page.wait_for_timeout(2000)
+            return
+    except Exception:
+        pass
+
+    # Fallback: JavaScript click on visible element with matching text
+    try:
+        await sf_frame.evaluate("""
+            (() => {
+                const elements = document.querySelectorAll('*');
+                for (const el of elements) {
+                    if (el.textContent.trim() === 'Permit Files' && el.offsetParent !== null) {
+                        el.click();
+                        return;
+                    }
+                }
+            })()
+        """)
+        await sf_frame.page.wait_for_timeout(2000)
+    except Exception:
+        pass
 
 
 async def click_file_and_get_url(sf_frame, context, file_row_index: int, config: PermitTypeConfig) -> Optional[str]:
@@ -679,8 +756,17 @@ def should_download_file(file_info: dict, existing_files: set, min_year: int) ->
     return True, "OK"
 
 
-async def discover_all_permits(config: PermitTypeConfig, headless: bool = True) -> list:
-    """Phase 1: Scan all pages and collect permit metadata."""
+async def discover_all_permits(config: PermitTypeConfig, headless: bool = True, force: bool = False) -> list:
+    """Phase 1: Scan all pages and collect permit metadata.
+
+    Uses a cached permits list if available, unless force=True.
+    """
+    # Try to load from cache unless force is specified
+    if not force:
+        cached_permits = load_permits_cache(config)
+        if cached_permits:
+            return cached_permits
+
     permits = []
 
     async with async_playwright() as p:
@@ -735,6 +821,9 @@ async def discover_all_permits(config: PermitTypeConfig, headless: bool = True) 
 
             print(f"  Discovery complete: {len(permits)} permits found")
 
+            # Save to cache for future runs
+            save_permits_cache(permits, config)
+
         finally:
             await browser.close()
 
@@ -765,6 +854,9 @@ async def process_permit(
         print(f"{prefix}       FAILED to open permit {permit.permit_id}")
         local_stats['failed'] += 1
         return local_stats
+
+    # Ensure we're viewing permit-specific files, not General Files
+    await ensure_permit_detail_tab(sf_frame)
 
     await sort_by_doc_year(sf_frame)
 
@@ -919,7 +1011,8 @@ async def download_queue_parallel(
     headless: bool = True,
     dry_run: bool = False,
     min_year: int = 2020,
-    single_permit: Optional[str] = None
+    single_permit: Optional[str] = None,
+    force: bool = False
 ) -> dict:
     """Queue-based parallel downloading - main entry point."""
     print()
@@ -927,7 +1020,7 @@ async def download_queue_parallel(
     print("PHASE 1: Discovery")
     print("=" * 60)
 
-    all_permits = await discover_all_permits(config, headless=headless)
+    all_permits = await discover_all_permits(config, headless=headless, force=force)
     print(f"Discovered {len(all_permits)} permits across all pages")
 
     if single_permit:
@@ -1105,6 +1198,9 @@ async def download_worker(
                         print(f"{prefix}       FAILED to open permit {permit_id}")
                         stats['failed'] += 1
                         continue
+
+                    # Ensure we're viewing permit-specific files, not General Files
+                    await ensure_permit_detail_tab(sf_frame)
 
                     await sort_by_doc_year(sf_frame)
 
@@ -1361,6 +1457,9 @@ async def download_all_files(
                         stats['failed'] += 1
                         continue
 
+                    # Ensure we're viewing permit-specific files, not General Files
+                    await ensure_permit_detail_tab(sf_frame)
+
                     await sort_by_doc_year(sf_frame)
 
                     file_debug_dir = config.output_dir / "debug" / f"permit_{permit_id}"
@@ -1456,6 +1555,8 @@ async def main():
                         help="Process only this permit ID (for testing)")
     parser.add_argument("--workers", type=int, default=1,
                         help="Number of parallel browser instances (default: 1)")
+    parser.add_argument("--force", action="store_true",
+                        help="Force re-scraping permits list (ignore cache)")
     args = parser.parse_args()
 
     config = PERMIT_CONFIGS[args.type]
@@ -1470,6 +1571,7 @@ async def main():
         print(f"Pages:         {args.start_page} to {args.end_page or 'end'}")
     print(f"Min year:      {args.min_year}")
     print(f"Single permit: {args.single_permit or 'None (all permits)'}")
+    print(f"Force rescan:  {args.force}")
     print()
 
     try:
@@ -1483,7 +1585,8 @@ async def main():
                 headless=args.headless,
                 dry_run=args.dry_run,
                 min_year=args.min_year,
-                single_permit=args.single_permit
+                single_permit=args.single_permit,
+                force=args.force
             )
         else:
             stats = await download_all_files(
