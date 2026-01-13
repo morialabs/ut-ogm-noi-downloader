@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Utah OGM Coal Permit Files Downloader (Wrapper)
+Utah OGM Minerals Permit Files Downloader (Wrapper)
 
 This is a backward-compatible wrapper for the unified ogm_downloader.py script.
 All functionality has been merged into ogm_downloader.py.
 
 Usage:
-    python download_coal.py                      # Download all (visible browser)
-    python download_coal.py --headless           # Run headless
-    python download_coal.py --dry-run            # List without downloading
-    python download_coal.py --single-permit C0070001  # Process only one permit
-    python download_coal.py --start-page 5       # Start from page 5
-    python download_coal.py --min-year 2015      # Custom year filter
-    python download_coal.py --workers 4          # Run 4 parallel browser instances
+    python download_minerals.py                      # Download all (visible browser)
+    python download_minerals.py --headless           # Run headless
+    python download_minerals.py --dry-run            # List without downloading
+    python download_minerals.py --single-permit M0070001  # Process only one permit
+    python download_minerals.py --start-page 5       # Start from page 5
+    python download_minerals.py --min-year 2015      # Custom year filter
+    python download_minerals.py --workers 4          # Run 4 parallel browser instances
 """
 
 import sys
@@ -20,7 +20,7 @@ import asyncio
 import argparse
 
 from ogm_downloader import (
-    COAL_CONFIG,
+    MINERALS_CONFIG,
     DEFAULT_MIN_YEAR,
     download_all_files,
     download_queue_parallel,
@@ -28,7 +28,7 @@ from ogm_downloader import (
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Download coal permit files from Utah OGM")
+    parser = argparse.ArgumentParser(description="Download minerals permit files from Utah OGM")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode")
     parser.add_argument("--dry-run", action="store_true", help="List documents without downloading")
     parser.add_argument("--start-page", type=int, default=1, help="Start from specific page (default: 1)")
@@ -41,10 +41,10 @@ async def main():
                         help="Number of parallel browser instances (default: 1)")
     args = parser.parse_args()
 
-    config = COAL_CONFIG
+    config = MINERALS_CONFIG
 
     print("=" * 60)
-    print("Utah OGM Coal Permit Files Downloader")
+    print("Utah OGM Minerals Permit Files Downloader")
     print("=" * 60)
     print(f"Mode:          {'Headless' if args.headless else 'Visible browser'}")
     print(f"Dry run:       {args.dry_run}")
