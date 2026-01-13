@@ -115,13 +115,16 @@ def show_sample(client: QdrantClient, collection_name: str, count: int) -> None:
     print(f"\nSample documents ({len(points)}):")
     for i, point in enumerate(points, 1):
         payload = point.payload
+        meta = payload.get("meta_data", {})
         print(f"\n--- Document {i} ---")
         print(f"  Mine: {payload.get('mine_name', 'N/A')}")
-        print(f"  File: {payload.get('source_file', 'N/A')}")
-        print(f"  Page: {payload.get('page_number', 'N/A')}")
-        print(f"  Chunk: {payload.get('chunk_index', 'N/A')}")
-        print(f"  Date: {payload.get('file_date', 'N/A')}")
-        print(f"  Description: {payload.get('description', 'N/A')[:50]}...")
+        print(f"  Source: {meta.get('source', 'N/A')}")
+        print(f"  File: {meta.get('filename', 'N/A')}")
+        print(f"  Page: {meta.get('page_number', 'N/A')}")
+        print(f"  Chunk: {meta.get('chunk_index', 'N/A')}")
+        print(f"  Date: {meta.get('file_date', 'N/A')}")
+        desc = meta.get('description', 'N/A') or 'N/A'
+        print(f"  Description: {desc[:50]}...")
         content = payload.get("content", "")
         preview = content[:150].replace("\n", " ") + "..." if len(content) > 150 else content.replace("\n", " ")
         print(f"  Content: {preview}")
@@ -151,10 +154,11 @@ def search_documents(
     print(f"Found {len(results.points)} results:\n")
     for i, result in enumerate(results.points, 1):
         payload = result.payload
+        meta = payload.get("meta_data", {})
         print(f"--- Result {i} (score: {result.score:.4f}) ---")
         print(f"  Mine: {payload.get('mine_name', 'N/A')}")
-        print(f"  File: {payload.get('source_file', 'N/A')}")
-        print(f"  Page: {payload.get('page_number', 'N/A')}")
+        print(f"  File: {meta.get('filename', 'N/A')}")
+        print(f"  Page: {meta.get('page_number', 'N/A')}")
         content = payload.get("content", "")
         preview = content[:300].replace("\n", " ") + "..." if len(content) > 300 else content.replace("\n", " ")
         print(f"  Content: {preview}")
@@ -172,7 +176,7 @@ def search_by_mine(
         collection_name=collection_name,
         scroll_filter={"must": [{"key": "mine_name", "match": {"value": mine_name}}]},
         limit=limit,
-        with_payload=["source_file", "page_number", "chunk_index", "file_date"],
+        with_payload=["meta_data"],
         with_vectors=False,
     )
     points, _ = results
@@ -180,7 +184,8 @@ def search_by_mine(
     print(f"\nDocuments for mine '{mine_name}' ({len(points)} chunks):")
     seen_files = set()
     for point in points:
-        source = point.payload.get("source_file", "N/A")
+        meta = point.payload.get("meta_data", {})
+        source = meta.get("filename", "N/A")
         if source not in seen_files:
             seen_files.add(source)
             print(f"  - {source}")
@@ -232,9 +237,7 @@ def main():
 
     # Get unique counts
     mines = get_unique_values(qdrant_client, args.collection_name, "mine_name")
-    files = get_unique_values(qdrant_client, args.collection_name, "source_file")
     print(f"  Unique mines: {len(mines)}")
-    print(f"  Unique files: {len(files)}")
 
     # Optional operations
     if args.list_mines:

@@ -79,6 +79,19 @@ def create_collection(client: QdrantClient, collection_name: str) -> None:
     )
     print(f"Created collection '{collection_name}'")
 
+    # Create payload indexes for efficient filtering
+    client.create_payload_index(
+        collection_name=collection_name,
+        field_name="meta_data.mine_name",
+        field_schema=models.PayloadSchemaType.KEYWORD,
+    )
+    client.create_payload_index(
+        collection_name=collection_name,
+        field_name="meta_data.source",
+        field_schema=models.PayloadSchemaType.KEYWORD,
+    )
+    print(f"Created payload indexes for '{collection_name}'")
+
 
 def extract_pdf_text(pdf_path: Path, max_pages: int = MAX_PAGES) -> list[tuple[int, str]]:
     """
@@ -282,15 +295,19 @@ def upload_document(
             id=chunk_id,
             vector={"dense": embedding},
             payload={
-                "mine_name": mine_name,
-                "source_file": pdf_path.name,
-                "page_number": chunk["page_number"],
-                "chunk_index": chunk["chunk_index"],
+                "mine_name": mine_name,  # Root level for Agno compatibility
                 "content": chunk["text"],
-                "file_date": file_metadata["file_date"],
-                "description": file_metadata["description"],
-                "doc_from": file_metadata["doc_from"],
-                "doc_to": file_metadata["doc_to"],
+                "meta_data": {
+                    "mine_name": mine_name,
+                    "source": "utah_ogm",  # Required for filtering
+                    "filename": pdf_path.name,  # Renamed from source_file
+                    "page_number": chunk["page_number"],
+                    "chunk_index": chunk["chunk_index"],
+                    "file_date": file_metadata["file_date"],
+                    "description": file_metadata["description"],
+                    "doc_from": file_metadata["doc_from"],
+                    "doc_to": file_metadata["doc_to"],
+                }
             }
         ))
 
