@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-Utah OGM Coal Permit Files Downloader
+Utah OGM Permit Files Downloader (Unified)
 
-Downloads coal permit files from ogm.utah.gov/coal-files/
-Navigates through permits and downloads documents from 2020 onwards.
+Downloads permit files from Utah OGM portals for both coal and minerals permits.
+Supports sequential, parallel, and queue-based parallel download modes.
 
 Usage:
-    python download_coal.py                      # Download all (visible browser)
-    python download_coal.py --headless           # Run headless
-    python download_coal.py --dry-run            # List without downloading
-    python download_coal.py --single-permit C0070001  # Process only one permit
-    python download_coal.py --start-page 5       # Start from page 5
-    python download_coal.py --min-year 2015      # Custom year filter
-    python download_coal.py --workers 4          # Run 4 parallel browser instances
+    python ogm_downloader.py --type coal                    # Download coal permits
+    python ogm_downloader.py --type minerals                # Download minerals permits
+    python ogm_downloader.py --type coal --headless         # Run headless
+    python ogm_downloader.py --type coal --dry-run          # List without downloading
+    python ogm_downloader.py --type coal --single-permit C0070001  # Process one permit
+    python ogm_downloader.py --type coal --workers 4        # Queue-based parallel mode
 """
 
 import asyncio
@@ -24,6 +23,42 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 from playwright.async_api import async_playwright
+
+
+@dataclass
+class PermitTypeConfig:
+    """Configuration for a specific permit type (coal or minerals)."""
+    name: str
+    output_dir: Path
+    portal_url: str
+    permit_pattern_js: str  # JavaScript regex pattern for permit IDs
+    permit_pattern_py: str  # Python regex pattern for permit IDs
+    click_timeout: int      # Timeout in ms for clicking files
+
+
+# Pre-configured permit types
+COAL_CONFIG = PermitTypeConfig(
+    name="coal",
+    output_dir=Path(__file__).parent / "output_coal",
+    portal_url="https://ogm.utah.gov/coal-files/",
+    permit_pattern_js=r"^(C|ACT)\d+$",
+    permit_pattern_py=r"^(C|ACT)\d+$",
+    click_timeout=180000,
+)
+
+MINERALS_CONFIG = PermitTypeConfig(
+    name="minerals",
+    output_dir=Path(__file__).parent / "output_minerals",
+    portal_url="https://ogm.utah.gov/minerals-files/",
+    permit_pattern_js=r"^(M|S)\d+$",
+    permit_pattern_py=r"^(M|S)\d+$",
+    click_timeout=60000,
+)
+
+PERMIT_CONFIGS = {
+    "coal": COAL_CONFIG,
+    "minerals": MINERALS_CONFIG,
+}
 
 
 @dataclass
@@ -44,9 +79,8 @@ class SharedState:
     stats: dict
     stats_lock: asyncio.Lock
 
-# Configuration
-OUTPUT_DIR = Path(__file__).parent / "output_coal"
-PORTAL_URL = "https://ogm.utah.gov/coal-files/"
+
+# Common configuration
 DEFAULT_MIN_YEAR = 2020
 RATE_LIMIT_DELAY = 2.0  # seconds between downloads
 MAX_RETRIES = 3
@@ -70,14 +104,14 @@ def sanitize_mine_name(name: str) -> str:
     return sanitize_filename_part(name) or "unknown_mine"
 
 
-def get_existing_coal_documents() -> dict[str, set]:
+def get_existing_documents(config: PermitTypeConfig) -> dict[str, set]:
     """Scan output directory and return dict of mine_name -> set of filenames."""
     existing = {}
 
-    if not OUTPUT_DIR.exists():
+    if not config.output_dir.exists():
         return existing
 
-    for mine_dir in OUTPUT_DIR.iterdir():
+    for mine_dir in config.output_dir.iterdir():
         if mine_dir.is_dir() and mine_dir.name != 'debug':
             existing[mine_dir.name] = {f.name for f in mine_dir.glob('*.pdf')}
 
@@ -98,81 +132,64 @@ async def get_current_page_info(sf_frame) -> dict:
     return {'current': 1, 'total': 1}
 
 
-async def get_all_permits_on_page(sf_frame) -> list[dict]:
-    """Extract all permit records from current page.
-
-    Returns list of dicts with:
-    - row_index: int
-    - permit_id: str (e.g., "C0070001")
-    - mine_name: str (for output directory)
-    - operator: str
-    """
-    rows = await sf_frame.evaluate("""
-        (() => {
+async def get_all_permits_on_page(sf_frame, config: PermitTypeConfig) -> list[dict]:
+    """Extract all permit records from current page."""
+    permit_pattern_js = config.permit_pattern_js
+    rows = await sf_frame.evaluate(f"""
+        (() => {{
             const records = [];
-
-            // Get visible text and parse it
             const bodyText = document.body.innerText;
             const lines = bodyText.split('\\n').map(l => l.trim()).filter(l => l);
-
-            // Coal permit IDs start with C or ACT followed by digits
-            const permitPattern = /^(C|ACT)\\d+$/i;
+            const permitPattern = /{permit_pattern_js}/i;
 
             let rowIndex = 0;
 
-            for (let i = 0; i < lines.length; i++) {
+            for (let i = 0; i < lines.length; i++) {{
                 const line = lines[i];
 
-                // Permit ID found - look backwards for mine name (after SELECT)
-                if (permitPattern.test(line)) {
+                if (permitPattern.test(line)) {{
                     let mineName = '';
                     let operator = '';
                     let county = '';
 
-                    // Mine name is typically 1-2 lines before permit ID (after SELECT)
-                    for (let j = i - 1; j >= Math.max(0, i - 3); j--) {
+                    for (let j = i - 1; j >= Math.max(0, i - 3); j--) {{
                         const prevLine = lines[j];
-                        if (prevLine === 'SELECT' || prevLine === 'VIEW') {
+                        if (prevLine === 'SELECT' || prevLine === 'VIEW') {{
                             break;
-                        }
-                        if (!permitPattern.test(prevLine) && prevLine.length > 2) {
+                        }}
+                        if (!permitPattern.test(prevLine) && prevLine.length > 2) {{
                             mineName = prevLine;
                             break;
-                        }
-                    }
+                        }}
+                    }}
 
-                    // County and operator are after permit ID
-                    if (i + 1 < lines.length && !permitPattern.test(lines[i + 1])) {
+                    if (i + 1 < lines.length && !permitPattern.test(lines[i + 1])) {{
                         county = lines[i + 1];
-                    }
-                    if (i + 2 < lines.length && !permitPattern.test(lines[i + 2]) && lines[i + 2] !== 'SELECT') {
+                    }}
+                    if (i + 2 < lines.length && !permitPattern.test(lines[i + 2]) && lines[i + 2] !== 'SELECT') {{
                         operator = lines[i + 2];
-                    }
+                    }}
 
-                    records.push({
+                    records.push({{
                         row_index: rowIndex++,
                         permit_id: line,
                         mine_name: mineName,
                         county: county,
                         operator: operator
-                    });
-                }
-            }
+                    }});
+                }}
+            }}
 
             return records;
-        })()
+        }})()
     """)
     return rows
 
 
 async def sort_by_doc_year(sf_frame) -> bool:
-    """Click on 'Doc Year' column header twice to sort descending (newest first).
-
-    Returns True if successfully clicked sort.
-    """
+    """Click on 'Doc Year' column header twice to sort descending (newest first)."""
     try:
         doc_year_header = sf_frame.get_by_text("Doc Year", exact=False).first
-        # Click twice: first to sort, second to sort descending
         await doc_year_header.click()
         await sf_frame.page.wait_for_timeout(2000)
         await doc_year_header.click()
@@ -183,27 +200,26 @@ async def sort_by_doc_year(sf_frame) -> bool:
         return False
 
 
-async def get_files_in_permit(sf_frame) -> list[dict]:
+async def get_files_in_permit(sf_frame, config: PermitTypeConfig) -> list[dict]:
     """Extract all files from the current permit's file list view."""
-    rows = await sf_frame.evaluate("""
-        (() => {
+    permit_pattern_js = config.permit_pattern_js
+    rows = await sf_frame.evaluate(f"""
+        (() => {{
             const records = [];
             const bodyText = document.body.innerText;
             const lines = bodyText.split('\\n').map(l => l.trim()).filter(l => l);
 
-            // Patterns
-            const permitPattern = /^C\\d+$/;  // Coal permit ID
-            const yearPattern = /^(19|20)\\d{2}$/;
-            const datePattern = /^\\d{4}-\\d{2}-\\d{2}$/;
+            const permitPattern = /{permit_pattern_js}/;
+            const yearPattern = /^(19|20)\\d{{2}}$/;
+            const datePattern = /^\\d{{4}}-\\d{{2}}-\\d{{2}}$/;
             const locationPattern = /^(Outgoing|Incoming|Internal)$/;
 
             let rowIndex = 0;
 
-            for (let i = 0; i < lines.length; i++) {
+            for (let i = 0; i < lines.length; i++) {{
                 const line = lines[i];
 
-                // Start of a file record - detect by permit ID
-                if (permitPattern.test(line)) {
+                if (permitPattern.test(line)) {{
                     let docYear = 0;
                     let fileDate = '';
                     let docLocation = '';
@@ -211,37 +227,30 @@ async def get_files_in_permit(sf_frame) -> list[dict]:
                     let docFrom = '';
                     let docRegarding = '';
 
-                    // Parse next lines for file info
-                    // Expected order: year, date, location, to, from, regarding
-                    let fieldIndex = 0;
-                    for (let j = i + 1; j < Math.min(i + 10, lines.length); j++) {
+                    for (let j = i + 1; j < Math.min(i + 10, lines.length); j++) {{
                         const nextLine = lines[j];
 
-                        // Stop if we hit another permit ID (next record)
                         if (permitPattern.test(nextLine)) break;
-                        // Skip header/footer lines
                         if (nextLine.match(/^(First|Previous|Next|Last|Showing|Sort by|Navigation Mode|VIEW)/)) continue;
                         if (nextLine === 'Sorted: None' || nextLine === 'Sorted Descending' || nextLine === 'Sorted Ascending') continue;
 
-                        // Parse based on position and pattern
-                        if (yearPattern.test(nextLine) && !docYear) {
+                        if (yearPattern.test(nextLine) && !docYear) {{
                             docYear = parseInt(nextLine, 10);
-                        } else if (datePattern.test(nextLine) && !fileDate) {
+                        }} else if (datePattern.test(nextLine) && !fileDate) {{
                             fileDate = nextLine;
-                        } else if (locationPattern.test(nextLine) && !docLocation) {
+                        }} else if (locationPattern.test(nextLine) && !docLocation) {{
                             docLocation = nextLine;
-                        } else if (!docTo && docLocation && !docFrom) {
+                        }} else if (!docTo && docLocation && !docFrom) {{
                             docTo = nextLine;
-                        } else if (!docFrom && docTo) {
+                        }} else if (!docFrom && docTo) {{
                             docFrom = nextLine;
-                        } else if (!docRegarding && docFrom) {
+                        }} else if (!docRegarding && docFrom) {{
                             docRegarding = nextLine;
-                        }
-                    }
+                        }}
+                    }}
 
-                    // Only add if we have meaningful data
-                    if (docYear || fileDate) {
-                        records.push({
+                    if (docYear || fileDate) {{
+                        records.push({{
                             row_index: rowIndex++,
                             permit_id: line,
                             description: docRegarding || 'Document',
@@ -250,22 +259,19 @@ async def get_files_in_permit(sf_frame) -> list[dict]:
                             doc_location: docLocation,
                             doc_to: docTo,
                             doc_from: docFrom
-                        });
-                    }
-                }
-            }
+                        }});
+                    }}
+                }}
+            }}
 
             return records;
-        })()
+        }})()
     """)
     return rows
 
 
 async def click_permit_row(sf_frame, row_index: int) -> bool:
-    """Click the button on a permit row to view its files.
-
-    Returns True if successfully opened file list view.
-    """
+    """Click the button on a permit row to view its files."""
     try:
         await sf_frame.page.keyboard.press('Escape')
         await sf_frame.page.wait_for_timeout(500)
@@ -274,7 +280,6 @@ async def click_permit_row(sf_frame, row_index: int) -> bool:
 
     row_selector = f'tr[data-row-key-value="row-{row_index}"]:visible'
 
-    # Try hover + click first (most reliable for Salesforce hint-parent pattern)
     try:
         row = sf_frame.locator(row_selector).first
         await row.hover()
@@ -286,7 +291,6 @@ async def click_permit_row(sf_frame, row_index: int) -> bool:
     except Exception as e:
         print(f"       Hover+click failed: {e}")
 
-    # Fallback: JavaScript click
     try:
         result = await sf_frame.evaluate(f"""
             (() => {{
@@ -310,11 +314,8 @@ async def click_permit_row(sf_frame, row_index: int) -> bool:
     return False
 
 
-async def click_file_and_get_url(sf_frame, context, file_row_index: int) -> Optional[str]:
-    """Click on a file row to get PDF URL.
-
-    Returns the PDF URL if successful, None otherwise.
-    """
+async def click_file_and_get_url(sf_frame, context, file_row_index: int, config: PermitTypeConfig) -> Optional[str]:
+    """Click on a file row to get PDF URL."""
     try:
         await sf_frame.page.keyboard.press('Escape')
         await sf_frame.page.wait_for_timeout(500)
@@ -324,7 +325,6 @@ async def click_file_and_get_url(sf_frame, context, file_row_index: int) -> Opti
     row_selector = f'tr[data-row-key-value="row-{file_row_index}"]:visible'
     captured_pdf_url = None
 
-    # Set up listener to capture PDF URLs from new page requests
     def create_request_handler():
         nonlocal captured_pdf_url
         def on_request(request):
@@ -339,14 +339,13 @@ async def click_file_and_get_url(sf_frame, context, file_row_index: int) -> Opti
 
     context.on('page', on_new_page)
 
-    # Try hover + click to open new page
     try:
         row = sf_frame.locator(row_selector).first
         await row.hover()
         await sf_frame.page.wait_for_timeout(500)
         view_button = row.locator('lightning-button-icon').first
 
-        async with context.expect_page(timeout=180000) as new_page_info:
+        async with context.expect_page(timeout=config.click_timeout) as new_page_info:
             await view_button.click(force=True)
 
         new_page = await new_page_info.value
@@ -358,7 +357,6 @@ async def click_file_and_get_url(sf_frame, context, file_row_index: int) -> Opti
     except Exception as e:
         print(f"       Click failed: {e}")
 
-    # Fallback: check for any new tabs that may have opened
     await sf_frame.page.wait_for_timeout(2000)
     all_pages = context.pages
     if len(all_pages) > 1:
@@ -369,13 +367,12 @@ async def click_file_and_get_url(sf_frame, context, file_row_index: int) -> Opti
     return None
 
 
-async def download_coal_file(pdf_url: str, mine_name: str, file_info: dict) -> Optional[Path]:
-    """Download PDF and save to output/{mine_name}/ directory."""
+async def download_file(pdf_url: str, mine_name: str, file_info: dict, config: PermitTypeConfig) -> Optional[Path]:
+    """Download PDF and save to output directory."""
     safe_name = sanitize_mine_name(mine_name)
-    mine_dir = OUTPUT_DIR / safe_name
+    mine_dir = config.output_dir / safe_name
     mine_dir.mkdir(parents=True, exist_ok=True)
 
-    # Generate filename from file_info
     file_date = file_info.get('file_date', 'unknown')
     description = file_info.get('description', 'Document')
     doc_from = file_info.get('doc_from', '')
@@ -409,7 +406,6 @@ async def download_coal_file(pdf_url: str, mine_name: str, file_info: dict) -> O
         response.raise_for_status()
         content_bytes = response.content
 
-        # Verify it's a PDF
         if content_bytes[:4] == b'%PDF':
             output_path.write_bytes(content_bytes)
             return output_path
@@ -430,19 +426,14 @@ async def cleanup_extra_tabs(context):
             await page.close()
 
 
-async def navigate_back_to_permit_list(sf_frame) -> bool:
-    """Navigate back from file list to permit list by switching tabs.
-
-    Returns True if successful.
-    """
-    # Close any open panels first
+async def navigate_back_to_permit_list(sf_frame, config: PermitTypeConfig) -> bool:
+    """Navigate back from file list to permit list by switching tabs."""
     try:
         await sf_frame.page.keyboard.press('Escape')
         await sf_frame.page.wait_for_timeout(500)
     except Exception:
         pass
 
-    # Switch to General Files tab, then back to Permit Files to reset the view
     try:
         general_files_tab = sf_frame.get_by_text("General Files", exact=True)
         await general_files_tab.click()
@@ -453,12 +444,12 @@ async def navigate_back_to_permit_list(sf_frame) -> bool:
         await sf_frame.page.wait_for_timeout(3000)
 
         body_text = await sf_frame.evaluate("() => document.body.innerText")
-        if ">C" not in body_text[:1000] and "MINE NAME" in body_text:
+        # Check we're back at permit list (permit IDs visible)
+        if "MINE NAME" in body_text:
             return True
     except Exception as e:
         print(f"       Tab switch navigation failed: {e}")
 
-    # Fallback: click Permit Files tab directly via JavaScript
     try:
         await sf_frame.evaluate("""
             (() => {
@@ -487,14 +478,12 @@ async def navigate_to_next_page(sf_frame) -> bool:
     if page_info['current'] >= page_info['total']:
         return False
 
-    # Close any open detail panels
     try:
         await sf_frame.page.keyboard.press('Escape')
         await sf_frame.page.wait_for_timeout(500)
     except Exception:
         pass
 
-    # Click Permit Files tab to ensure it's focused
     try:
         permit_files_tab = sf_frame.get_by_text("Permit Files", exact=True)
         await permit_files_tab.click()
@@ -504,7 +493,6 @@ async def navigate_to_next_page(sf_frame) -> bool:
 
     page_info = await get_current_page_info(sf_frame)
 
-    # Strategy 1: JavaScript click with Shadow DOM traversal
     try:
         result = await sf_frame.evaluate("""
             (() => {
@@ -555,7 +543,6 @@ async def navigate_to_next_page(sf_frame) -> bool:
     except Exception as e:
         print(f"       JS navigation error: {e}")
 
-    # Strategy 2: Playwright dispatch_event
     try:
         next_buttons = sf_frame.get_by_role("button", name="Next")
         count = await next_buttons.count()
@@ -570,7 +557,6 @@ async def navigate_to_next_page(sf_frame) -> bool:
     except Exception:
         pass
 
-    # Strategy 3: Element handle evaluation
     try:
         next_button = sf_frame.locator('button:has-text("Next")').first
         await next_button.evaluate("el => el.click()")
@@ -584,20 +570,14 @@ async def navigate_to_next_page(sf_frame) -> bool:
 
 
 async def navigate_to_page(sf_frame, target_page: int, current_page: int) -> int:
-    """Navigate from current_page to target_page.
-
-    If target < current, must reload and navigate from page 1.
-    Returns the actual page number after navigation.
-    """
+    """Navigate from current_page to target_page."""
     if target_page == current_page:
         return current_page
 
     if target_page < current_page:
-        # Must reload and start from page 1
         await sf_frame.page.reload(wait_until="networkidle")
         await sf_frame.page.wait_for_timeout(5000)
 
-        # Re-click Permit Files tab
         try:
             permit_files_tab = sf_frame.get_by_text("Permit Files", exact=True)
             await permit_files_tab.wait_for(state="visible", timeout=30000)
@@ -618,7 +598,6 @@ async def navigate_to_page(sf_frame, target_page: int, current_page: int) -> int
         await sf_frame.page.wait_for_timeout(3000)
         current_page = 1
 
-    # Navigate forward to target
     while current_page < target_page:
         success = await navigate_to_next_page(sf_frame)
         if success:
@@ -666,11 +645,42 @@ async def setup_permit_files_tab(sf_frame):
     await sf_frame.page.wait_for_timeout(5000)
 
 
-async def discover_all_permits(headless: bool = True) -> list:
-    """Phase 1: Scan all pages and collect permit metadata.
+def should_download_file(file_info: dict, existing_files: set, min_year: int) -> tuple[bool, str]:
+    """Determine if a file should be downloaded. Returns (should_download, reason)."""
+    doc_year = file_info.get('doc_year', 0)
+    file_date = file_info.get('file_date', '')
+    description = file_info.get('description', '')
+    doc_from = file_info.get('doc_from', '')
+    doc_to = file_info.get('doc_to', '')
 
-    Returns list of PermitWorkItem objects for all permits found.
-    """
+    parts = [file_date]
+    if description:
+        parts.append(sanitize_filename_part(description, 40))
+    if doc_from:
+        parts.append(f"from_{sanitize_filename_part(doc_from, 20)}")
+    if doc_to:
+        parts.append(f"to_{sanitize_filename_part(doc_to, 20)}")
+
+    base_filename = "_".join(parts)
+    if len(base_filename) > 180:
+        base_filename = base_filename[:180]
+
+    expected_filename = f"{base_filename}.pdf"
+
+    if expected_filename in existing_files:
+        return False, "Already downloaded"
+    for i in range(1, 10):
+        if f"{base_filename}_{i}.pdf" in existing_files:
+            return False, "Already downloaded"
+
+    if doc_year and doc_year < min_year:
+        return False, f"Doc year {doc_year} is before {min_year}"
+
+    return True, "OK"
+
+
+async def discover_all_permits(config: PermitTypeConfig, headless: bool = True) -> list:
+    """Phase 1: Scan all pages and collect permit metadata."""
     permits = []
 
     async with async_playwright() as p:
@@ -684,8 +694,8 @@ async def discover_all_permits(headless: bool = True) -> list:
         page = await context.new_page()
 
         try:
-            print("  Navigating to coal-files page...")
-            await page.goto(PORTAL_URL, wait_until="networkidle", timeout=60000)
+            print(f"  Navigating to {config.name}-files page...")
+            await page.goto(config.portal_url, wait_until="networkidle", timeout=60000)
             await page.wait_for_selector("iframe", timeout=30000)
             await page.wait_for_timeout(5000)
 
@@ -703,7 +713,7 @@ async def discover_all_permits(headless: bool = True) -> list:
             while current_page <= total_pages:
                 print(f"  Scanning page {current_page}/{total_pages}...")
 
-                page_permits = await get_all_permits_on_page(sf_frame)
+                page_permits = await get_all_permits_on_page(sf_frame, config)
 
                 for permit in page_permits:
                     permits.append(PermitWorkItem(
@@ -737,13 +747,11 @@ async def process_permit(
     context,
     permit: PermitWorkItem,
     shared: SharedState,
+    config: PermitTypeConfig,
     min_year: int,
     dry_run: bool
 ) -> dict:
-    """Process a single permit: click into it, get files, download matching ones.
-
-    Returns dict with counts: files_found, downloaded, skipped_exists, skipped_date, failed
-    """
+    """Process a single permit: click into it, get files, download matching ones."""
     prefix = f"[W{worker_id}]"
     local_stats = {
         'files_found': 0,
@@ -753,7 +761,6 @@ async def process_permit(
         'failed': 0
     }
 
-    # Click permit row
     if not await click_permit_row(sf_frame, permit.row_index):
         print(f"{prefix}       FAILED to open permit {permit.permit_id}")
         local_stats['failed'] += 1
@@ -761,7 +768,7 @@ async def process_permit(
 
     await sort_by_doc_year(sf_frame)
 
-    files = await get_files_in_permit(sf_frame)
+    files = await get_files_in_permit(sf_frame, config)
     local_stats['files_found'] = len(files)
     print(f"{prefix}       Found {len(files)} files in permit")
 
@@ -791,17 +798,16 @@ async def process_permit(
         success = False
         for attempt in range(MAX_RETRIES):
             try:
-                pdf_url = await click_file_and_get_url(sf_frame, context, file_info['row_index'])
+                pdf_url = await click_file_and_get_url(sf_frame, context, file_info['row_index'], config)
 
                 if pdf_url and pdf_url.startswith('http'):
-                    output_path = await download_coal_file(pdf_url, permit.mine_name, file_info)
+                    output_path = await download_file(pdf_url, permit.mine_name, file_info, config)
                     if output_path:
                         file_size = output_path.stat().st_size
                         print(f"{prefix}         SUCCESS: {output_path.name} ({file_size:,} bytes)")
                         local_stats['downloaded'] += 1
                         existing_files.add(output_path.name)
 
-                        # Mark as downloaded in shared state
                         async with shared.downloaded_lock:
                             shared.downloaded.add(f"{safe_mine_name}/{output_path.name}")
 
@@ -822,7 +828,7 @@ async def process_permit(
 
         await asyncio.sleep(RATE_LIMIT_DELAY)
 
-    await navigate_back_to_permit_list(sf_frame)
+    await navigate_back_to_permit_list(sf_frame, config)
     await cleanup_extra_tabs(context)
 
     return local_stats
@@ -832,13 +838,14 @@ async def queue_download_worker(
     worker_id: int,
     permit_queue: asyncio.Queue,
     shared: SharedState,
+    config: PermitTypeConfig,
     headless: bool,
     dry_run: bool,
     min_year: int
 ) -> None:
     """Queue-based download worker that pulls permits from shared queue."""
     prefix = f"[W{worker_id}]"
-    current_page = 0  # Not yet on any page
+    current_page = 0
 
     async with async_playwright() as p:
         browser_args = ['--disable-blink-features=AutomationControlled']
@@ -855,7 +862,7 @@ async def queue_download_worker(
 
         try:
             print(f"{prefix} Starting worker, navigating to portal...")
-            await page.goto(PORTAL_URL, wait_until="networkidle", timeout=60000)
+            await page.goto(config.portal_url, wait_until="networkidle", timeout=60000)
             await page.wait_for_selector("iframe", timeout=30000)
             await page.wait_for_timeout(5000)
 
@@ -867,7 +874,6 @@ async def queue_download_worker(
             current_page = 1
 
             while True:
-                # Try to get next permit from queue
                 try:
                     permit = await asyncio.wait_for(
                         permit_queue.get(),
@@ -881,18 +887,15 @@ async def queue_download_worker(
 
                 print(f"\n{prefix}   PERMIT: {permit.permit_id} - {permit.mine_name} (page {permit.page_num})")
 
-                # Navigate to correct page if needed
                 if permit.page_num != current_page:
                     print(f"{prefix}     Navigating from page {current_page} to {permit.page_num}...")
                     current_page = await navigate_to_page(sf_frame, permit.page_num, current_page)
 
-                # Process the permit
                 local_stats = await process_permit(
                     worker_id, sf_frame, context, permit,
-                    shared, min_year, dry_run
+                    shared, config, min_year, dry_run
                 )
 
-                # Update shared stats atomically
                 async with shared.stats_lock:
                     shared.stats['permits_processed'] = shared.stats.get('permits_processed', 0) + 1
                     shared.stats['total_files_found'] = shared.stats.get('total_files_found', 0) + local_stats['files_found']
@@ -911,27 +914,22 @@ async def queue_download_worker(
 
 
 async def download_queue_parallel(
+    config: PermitTypeConfig,
     num_workers: int = 4,
     headless: bool = True,
     dry_run: bool = False,
     min_year: int = 2020,
     single_permit: Optional[str] = None
 ) -> dict:
-    """Queue-based parallel downloading - main entry point.
-
-    Phase 1: Discovery - collect all permits
-    Phase 2: Queue-based download - workers pull from shared queue
-    """
+    """Queue-based parallel downloading - main entry point."""
     print()
     print("=" * 60)
     print("PHASE 1: Discovery")
     print("=" * 60)
 
-    # Discover all permits
-    all_permits = await discover_all_permits(headless=headless)
+    all_permits = await discover_all_permits(config, headless=headless)
     print(f"Discovered {len(all_permits)} permits across all pages")
 
-    # Filter for single permit if specified
     if single_permit:
         all_permits = [p for p in all_permits if p.permit_id == single_permit]
         print(f"Filtered to {len(all_permits)} permits matching {single_permit}")
@@ -946,15 +944,12 @@ async def download_queue_parallel(
             'failed': 0
         }
 
-    # Sort by page for efficient navigation
     all_permits.sort(key=lambda p: (p.page_num, p.row_index))
 
-    # Get existing documents
-    existing = get_existing_coal_documents()
+    existing = get_existing_documents(config)
     total_existing = sum(len(files) for files in existing.values())
     print(f"Found {total_existing} existing documents across {len(existing)} mines")
 
-    # Create shared state
     shared = SharedState(
         existing=existing,
         downloaded=set(),
@@ -970,7 +965,6 @@ async def download_queue_parallel(
         stats_lock=asyncio.Lock()
     )
 
-    # Populate queue
     permit_queue = asyncio.Queue()
     for permit in all_permits:
         await permit_queue.put(permit)
@@ -982,12 +976,12 @@ async def download_queue_parallel(
     print(f"Starting {num_workers} workers for {len(all_permits)} permits")
     print()
 
-    # Launch workers
     workers = [
         queue_download_worker(
             worker_id=i,
             permit_queue=permit_queue,
             shared=shared,
+            config=config,
             headless=headless,
             dry_run=dry_run,
             min_year=min_year
@@ -995,48 +989,12 @@ async def download_queue_parallel(
         for i in range(num_workers)
     ]
 
-    # Wait for all workers to complete
     await asyncio.gather(*workers, return_exceptions=True)
 
     return shared.stats
 
 
-def should_download_file(file_info: dict, existing_files: set, min_year: int) -> tuple[bool, str]:
-    """Determine if a file should be downloaded. Returns (should_download, reason)."""
-    doc_year = file_info.get('doc_year', 0)
-    file_date = file_info.get('file_date', '')
-    description = file_info.get('description', '')
-    doc_from = file_info.get('doc_from', '')
-    doc_to = file_info.get('doc_to', '')
-
-    # Generate expected filename for deduplication check (matches download_coal_file logic)
-    parts = [file_date]
-    if description:
-        parts.append(sanitize_filename_part(description, 40))
-    if doc_from:
-        parts.append(f"from_{sanitize_filename_part(doc_from, 20)}")
-    if doc_to:
-        parts.append(f"to_{sanitize_filename_part(doc_to, 20)}")
-
-    base_filename = "_".join(parts)
-    if len(base_filename) > 180:
-        base_filename = base_filename[:180]
-
-    expected_filename = f"{base_filename}.pdf"
-
-    if expected_filename in existing_files:
-        return False, "Already downloaded"
-    for i in range(1, 10):
-        if f"{base_filename}_{i}.pdf" in existing_files:
-            return False, "Already downloaded"
-
-    if doc_year and doc_year < min_year:
-        return False, f"Doc year {doc_year} is before {min_year}"
-
-    return True, "OK"
-
-
-async def get_total_pages(headless: bool = True) -> int:
+async def get_total_pages(config: PermitTypeConfig, headless: bool = True) -> int:
     """Quick probe to get total page count from the portal."""
     async with async_playwright() as p:
         browser_args = ['--disable-blink-features=AutomationControlled']
@@ -1049,28 +1007,15 @@ async def get_total_pages(headless: bool = True) -> int:
         page = await context.new_page()
 
         try:
-            await page.goto(PORTAL_URL, wait_until="networkidle", timeout=60000)
+            await page.goto(config.portal_url, wait_until="networkidle", timeout=60000)
             await page.wait_for_selector("iframe", timeout=30000)
             await page.wait_for_timeout(5000)
 
-            frames = page.frames
-            sf_frame = None
-            for frame in frames:
-                frame_url = frame.url
-                if "site.com" in frame_url.lower() or "salesforce" in frame_url.lower():
-                    sf_frame = frame
-                    break
-
-            if sf_frame is None and len(frames) > 1:
-                sf_frame = frames[1]
-
+            sf_frame = await get_salesforce_frame(page)
             if sf_frame is None:
                 raise Exception("Could not find Salesforce iframe")
 
-            permit_files_tab = sf_frame.get_by_text("Permit Files", exact=True)
-            await permit_files_tab.wait_for(state="visible", timeout=60000)
-            await permit_files_tab.click()
-            await page.wait_for_timeout(5000)
+            await setup_permit_files_tab(sf_frame)
 
             page_info = await get_current_page_info(sf_frame)
             return page_info['total']
@@ -1083,6 +1028,7 @@ async def download_worker(
     worker_id: int,
     start_page: int,
     end_page: int,
+    config: PermitTypeConfig,
     headless: bool,
     dry_run: bool,
     min_year: int,
@@ -1114,49 +1060,19 @@ async def download_worker(
         page = await context.new_page()
 
         try:
-            print(f"{prefix} Navigating to coal-files page...")
-            await page.goto(PORTAL_URL, wait_until="networkidle", timeout=60000)
+            print(f"{prefix} Navigating to {config.name}-files page...")
+            await page.goto(config.portal_url, wait_until="networkidle", timeout=60000)
 
             await page.wait_for_selector("iframe", timeout=30000)
             await page.wait_for_timeout(5000)
 
-            frames = page.frames
-            sf_frame = None
-            for frame in frames:
-                frame_url = frame.url
-                if "site.com" in frame_url.lower() or "salesforce" in frame_url.lower():
-                    sf_frame = frame
-                    break
-
-            if sf_frame is None and len(frames) > 1:
-                sf_frame = frames[1]
-
+            sf_frame = await get_salesforce_frame(page)
             if sf_frame is None:
                 raise Exception(f"{prefix} Could not find Salesforce iframe")
 
             print(f"{prefix} Clicking Permit Files tab...")
-            try:
-                permit_files_tab = sf_frame.get_by_text("Permit Files", exact=True)
-                await permit_files_tab.wait_for(state="visible", timeout=60000)
-                await permit_files_tab.click()
-            except Exception as e:
-                print(f"{prefix} Tab click via locator failed: {e}")
-                await sf_frame.evaluate("""
-                    (() => {
-                        const tabs = document.querySelectorAll('*');
-                        for (const tab of tabs) {
-                            if (tab.textContent.trim() === 'Permit Files' && tab.offsetParent !== null) {
-                                tab.click();
-                                return true;
-                            }
-                        }
-                        return false;
-                    })()
-                """)
+            await setup_permit_files_tab(sf_frame)
 
-            await page.wait_for_timeout(5000)
-
-            # Navigate to start_page if not page 1
             if start_page > 1:
                 print(f"{prefix} Navigating to page {start_page}...")
                 for _ in range(start_page - 1):
@@ -1169,7 +1085,7 @@ async def download_worker(
                 print(f"{prefix} PAGE {page_num}")
                 print(f"{prefix} {'='*40}")
 
-                permits = await get_all_permits_on_page(sf_frame)
+                permits = await get_all_permits_on_page(sf_frame, config)
                 print(f"{prefix} Found {len(permits)} permits on this page")
 
                 for permit in permits:
@@ -1192,13 +1108,12 @@ async def download_worker(
 
                     await sort_by_doc_year(sf_frame)
 
-                    files = await get_files_in_permit(sf_frame)
+                    files = await get_files_in_permit(sf_frame, config)
                     stats['total_files_found'] += len(files)
                     print(f"{prefix}       Found {len(files)} files in permit")
 
                     for file_info in files:
                         description = file_info.get('description', 'Document')
-                        doc_year = file_info.get('doc_year', 0)
                         file_date = file_info.get('file_date', '')
 
                         should_dl, reason = should_download_file(file_info, existing_files, min_year)
@@ -1221,10 +1136,10 @@ async def download_worker(
 
                         for attempt in range(MAX_RETRIES):
                             try:
-                                pdf_url = await click_file_and_get_url(sf_frame, context, file_info['row_index'])
+                                pdf_url = await click_file_and_get_url(sf_frame, context, file_info['row_index'], config)
 
                                 if pdf_url and pdf_url.startswith('http'):
-                                    output_path = await download_coal_file(pdf_url, mine_name, file_info)
+                                    output_path = await download_file(pdf_url, mine_name, file_info, config)
                                     if output_path:
                                         file_size = output_path.stat().st_size
                                         print(f"{prefix}         SUCCESS: {output_path.name} ({file_size:,} bytes)")
@@ -1247,7 +1162,7 @@ async def download_worker(
 
                         await asyncio.sleep(RATE_LIMIT_DELAY)
 
-                    await navigate_back_to_permit_list(sf_frame)
+                    await navigate_back_to_permit_list(sf_frame, config)
                     await cleanup_extra_tabs(context)
 
                     if single_permit and permit_id == single_permit:
@@ -1268,25 +1183,25 @@ async def download_worker(
 
 
 async def download_parallel(
+    config: PermitTypeConfig,
     num_workers: int = 4,
     headless: bool = True,
     dry_run: bool = False,
     min_year: int = 2020,
     single_permit: Optional[str] = None
 ) -> dict:
-    """Launch multiple workers to download in parallel."""
+    """Launch multiple workers to download in parallel (page-range based)."""
     print(f"Probing portal for total page count...")
-    total_pages = await get_total_pages(headless=headless)
+    total_pages = await get_total_pages(config, headless=headless)
     print(f"Total pages: {total_pages}")
 
-    # Adjust workers if more than pages
     actual_workers = min(num_workers, total_pages)
     if actual_workers < num_workers:
         print(f"Reducing workers from {num_workers} to {actual_workers} (only {total_pages} pages)")
 
     pages_per_worker = math.ceil(total_pages / actual_workers)
 
-    existing = get_existing_coal_documents()
+    existing = get_existing_documents(config)
     total_existing = sum(len(files) for files in existing.values())
     print(f"Found {total_existing} existing documents across {len(existing)} mines")
 
@@ -1304,6 +1219,7 @@ async def download_parallel(
             worker_id=i,
             start_page=start,
             end_page=end,
+            config=config,
             headless=headless,
             dry_run=dry_run,
             min_year=min_year,
@@ -1315,10 +1231,8 @@ async def download_parallel(
     print("=" * 60)
     print()
 
-    # Run all workers concurrently
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Aggregate stats
     total_stats = {
         'permits_processed': 0,
         'total_files_found': 0,
@@ -1338,7 +1252,8 @@ async def download_parallel(
     return total_stats
 
 
-async def download_all_coal_files(
+async def download_all_files(
+    config: PermitTypeConfig,
     headless: bool = False,
     dry_run: bool = False,
     start_page: int = 1,
@@ -1346,9 +1261,9 @@ async def download_all_coal_files(
     min_year: int = 2020,
     single_permit: Optional[str] = None
 ):
-    """Main function to download all coal permit files."""
+    """Main function to download all permit files (sequential mode)."""
 
-    existing = get_existing_coal_documents()
+    existing = get_existing_documents(config)
     total_existing = sum(len(files) for files in existing.values())
     print(f"Found {total_existing} existing documents across {len(existing)} mines")
 
@@ -1377,57 +1292,28 @@ async def download_all_coal_files(
         page = await context.new_page()
 
         try:
-            print("[1/4] Navigating to coal-files page...")
-            await page.goto(PORTAL_URL, wait_until="networkidle", timeout=60000)
+            print(f"[1/4] Navigating to {config.name}-files page...")
+            await page.goto(config.portal_url, wait_until="networkidle", timeout=60000)
 
             print("[2/4] Waiting for iframe to load...")
             await page.wait_for_selector("iframe", timeout=30000)
             await page.wait_for_timeout(5000)
 
-            frames = page.frames
-            sf_frame = None
-            for frame in frames:
-                frame_url = frame.url
-                if "site.com" in frame_url.lower() or "salesforce" in frame_url.lower():
-                    sf_frame = frame
-                    break
-
-            if sf_frame is None and len(frames) > 1:
-                sf_frame = frames[1]
-
+            sf_frame = await get_salesforce_frame(page)
             if sf_frame is None:
                 raise Exception("Could not find Salesforce iframe")
 
             print("[3/4] Clicking Permit Files tab...")
-            try:
-                permit_files_tab = sf_frame.get_by_text("Permit Files", exact=True)
-                await permit_files_tab.wait_for(state="visible", timeout=60000)
-                await permit_files_tab.click()
-            except Exception as e:
-                print(f"       Permit Files tab click via locator failed: {e}")
-                await sf_frame.evaluate("""
-                    (() => {
-                        const tabs = document.querySelectorAll('*');
-                        for (const tab of tabs) {
-                            if (tab.textContent.trim() === 'Permit Files' && tab.offsetParent !== null) {
-                                tab.click();
-                                return true;
-                            }
-                        }
-                        return false;
-                    })()
-                """)
+            await setup_permit_files_tab(sf_frame)
 
-            await page.wait_for_timeout(5000)
-
-            debug_dir = OUTPUT_DIR / "debug"
+            debug_dir = config.output_dir / "debug"
             debug_dir.mkdir(parents=True, exist_ok=True)
             body_text = await sf_frame.evaluate("() => document.body.innerText")
             content = await sf_frame.content()
-            (debug_dir / "coal_body_text.txt").write_text(body_text)
-            (debug_dir / "coal_content.html").write_text(content)
-            await page.screenshot(path=str(debug_dir / "coal_page.png"))
-            print("       Debug files saved to output_coal/debug/")
+            (debug_dir / f"{config.name}_body_text.txt").write_text(body_text)
+            (debug_dir / f"{config.name}_content.html").write_text(content)
+            await page.screenshot(path=str(debug_dir / f"{config.name}_page.png"))
+            print(f"       Debug files saved to {config.output_dir}/debug/")
 
             print("[4/4] Processing permits...")
 
@@ -1454,7 +1340,7 @@ async def download_all_coal_files(
                 print(f"PAGE {page_num}/{total_pages}")
                 print('='*50)
 
-                permits = await get_all_permits_on_page(sf_frame)
+                permits = await get_all_permits_on_page(sf_frame, config)
                 print(f"Found {len(permits)} permits on this page")
 
                 for permit in permits:
@@ -1477,18 +1363,17 @@ async def download_all_coal_files(
 
                     await sort_by_doc_year(sf_frame)
 
-                    file_debug_dir = OUTPUT_DIR / "debug" / f"permit_{permit_id}"
+                    file_debug_dir = config.output_dir / "debug" / f"permit_{permit_id}"
                     file_debug_dir.mkdir(parents=True, exist_ok=True)
                     file_body_text = await sf_frame.evaluate("() => document.body.innerText")
                     (file_debug_dir / "files_body_text.txt").write_text(file_body_text)
 
-                    files = await get_files_in_permit(sf_frame)
+                    files = await get_files_in_permit(sf_frame, config)
                     stats['total_files_found'] += len(files)
                     print(f"       Found {len(files)} files in permit")
 
                     for file_info in files:
                         description = file_info.get('description', 'Document')
-                        doc_year = file_info.get('doc_year', 0)
                         file_date = file_info.get('file_date', '')
 
                         should_dl, reason = should_download_file(file_info, existing_files, min_year)
@@ -1511,12 +1396,10 @@ async def download_all_coal_files(
 
                         for attempt in range(MAX_RETRIES):
                             try:
-                                pdf_url = await click_file_and_get_url(sf_frame, context, file_info['row_index'])
+                                pdf_url = await click_file_and_get_url(sf_frame, context, file_info['row_index'], config)
 
-                                # Only proceed if we got a valid URL from this specific click
-                                # Do NOT use fallback URLs - they may be from previous files
                                 if pdf_url and pdf_url.startswith('http'):
-                                    output_path = await download_coal_file(pdf_url, mine_name, file_info)
+                                    output_path = await download_file(pdf_url, mine_name, file_info, config)
                                     if output_path:
                                         file_size = output_path.stat().st_size
                                         print(f"         SUCCESS: {output_path.name} ({file_size:,} bytes)")
@@ -1539,7 +1422,7 @@ async def download_all_coal_files(
 
                         await asyncio.sleep(RATE_LIMIT_DELAY)
 
-                    await navigate_back_to_permit_list(sf_frame)
+                    await navigate_back_to_permit_list(sf_frame, config)
                     await cleanup_extra_tabs(context)
 
                     if single_permit and permit_id == single_permit:
@@ -1560,18 +1443,25 @@ async def download_all_coal_files(
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Download coal permit files from Utah OGM")
+    parser = argparse.ArgumentParser(description="Download permit files from Utah OGM")
+    parser.add_argument("--type", type=str, required=True, choices=["coal", "minerals"],
+                        help="Permit type to download (coal or minerals)")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode")
     parser.add_argument("--dry-run", action="store_true", help="List documents without downloading")
     parser.add_argument("--start-page", type=int, default=1, help="Start from specific page (default: 1)")
     parser.add_argument("--end-page", type=int, default=None, help="Stop at specific page (default: all)")
-    parser.add_argument("--min-year", type=int, default=DEFAULT_MIN_YEAR, help=f"Minimum document year (default: {DEFAULT_MIN_YEAR})")
-    parser.add_argument("--single-permit", type=str, default=None, help="Process only this permit ID (for testing)")
-    parser.add_argument("--workers", type=int, default=1, help="Number of parallel browser instances (default: 1)")
+    parser.add_argument("--min-year", type=int, default=DEFAULT_MIN_YEAR,
+                        help=f"Minimum document year (default: {DEFAULT_MIN_YEAR})")
+    parser.add_argument("--single-permit", type=str, default=None,
+                        help="Process only this permit ID (for testing)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of parallel browser instances (default: 1)")
     args = parser.parse_args()
 
+    config = PERMIT_CONFIGS[args.type]
+
     print("=" * 60)
-    print("Utah OGM Coal Permit Files Downloader")
+    print(f"Utah OGM {config.name.title()} Permit Files Downloader")
     print("=" * 60)
     print(f"Mode:          {'Headless' if args.headless else 'Visible browser'}")
     print(f"Dry run:       {args.dry_run}")
@@ -1584,11 +1474,11 @@ async def main():
 
     try:
         if args.workers > 1:
-            # Queue-based parallel mode - ignores start_page/end_page
             if args.start_page != 1 or args.end_page is not None:
                 print("Note: --start-page and --end-page are ignored in parallel mode")
                 print()
             stats = await download_queue_parallel(
+                config=config,
                 num_workers=args.workers,
                 headless=args.headless,
                 dry_run=args.dry_run,
@@ -1596,8 +1486,8 @@ async def main():
                 single_permit=args.single_permit
             )
         else:
-            # Sequential mode - original behavior
-            stats = await download_all_coal_files(
+            stats = await download_all_files(
+                config=config,
                 headless=args.headless,
                 dry_run=args.dry_run,
                 start_page=args.start_page,
