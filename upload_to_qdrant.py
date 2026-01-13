@@ -61,6 +61,16 @@ def get_openai_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
+def truncate_collection(client: QdrantClient, collection_name: str) -> None:
+    """Delete a Qdrant collection if it exists."""
+    collections = client.get_collections().collections
+    if any(c.name == collection_name for c in collections):
+        client.delete_collection(collection_name=collection_name)
+        print(f"Deleted collection '{collection_name}'")
+    else:
+        print(f"Collection '{collection_name}' does not exist, nothing to delete")
+
+
 def create_collection(client: QdrantClient, collection_name: str) -> None:
     """Create a Qdrant collection if it doesn't exist."""
     collections = client.get_collections().collections
@@ -327,6 +337,7 @@ def upload_all_documents(
     data_dir: Path,
     dry_run: bool = False,
     limit: Optional[int] = None,
+    truncate: bool = False,
 ) -> dict:
     """
     Upload all PDFs from a directory structure to Qdrant.
@@ -347,6 +358,10 @@ def upload_all_documents(
     # Get clients
     qdrant_client = get_qdrant_client()
     openai_client = get_openai_client()
+
+    # Truncate collection if requested
+    if truncate:
+        truncate_collection(qdrant_client, collection_name)
 
     # Create collection if needed
     create_collection(qdrant_client, collection_name)
@@ -416,6 +431,11 @@ def main():
         type=int,
         help="Process only N documents (for testing)",
     )
+    parser.add_argument(
+        "--truncate",
+        action="store_true",
+        help="Delete and recreate the collection before uploading",
+    )
 
     args = parser.parse_args()
 
@@ -431,6 +451,8 @@ def main():
     print(f"Data directory: {data_dir}")
     if args.dry_run:
         print("Mode: DRY RUN (no uploads)")
+    if args.truncate:
+        print("Mode: TRUNCATE (will delete existing collection)")
     if args.limit:
         print(f"Limit: {args.limit} documents")
     print()
@@ -440,6 +462,7 @@ def main():
         data_dir=data_dir,
         dry_run=args.dry_run,
         limit=args.limit,
+        truncate=args.truncate,
     )
 
     print()
