@@ -293,6 +293,7 @@ def upload_document(
             id=chunk_id,
             vector=embedding,
             payload={
+                "name": pdf_path.name,  # Agno requires this
                 "mine_name": mine_name,  # Root level for Agno compatibility
                 "content": chunk["text"],
                 "meta_data": {
